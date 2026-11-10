@@ -52,7 +52,8 @@ Ne publie jamais le token dans le code ou dans un dépôt.
 - `/give <montant>` — envoyer du cash en répondant au message d'un joueur
 - `/give @username <montant>` — envoyer du cash à un joueur inscrit dans le groupe
 - `/jugg` — menu des actions du mini-jeu
-- `/shop` — marketplace d'items de jeu, verrouillés par niveau
+- `/shop` — boutique Vêtements & Accessoires (tête, vestes, accessoires, pieds),
+  véhicules et équipement de jeu
 - `/inventory` — inventaire et bonus des items
 - `/braquer @username` — défi PVP fictif (niveau 20+)
 - `/top` — classement des dix joueurs les plus riches du contexte courant
@@ -77,10 +78,11 @@ son cooldown. Les réussites n'accordent pas d'XP. Le cooldown global persistant
 est enregistré avec le profil du joueur dans chaque conversation.
 Les profils existants sont migrés pour conserver le cash, le niveau et le XP,
 et ajouter l'indice de recherche ainsi que l'horodatage du dernier hustle.
-Les valeurs sont: colis (85%, +115$/−25$, 60 s), phishing (70%,
-+275$/−30$, 120 s), catalyseur (60%, +475$/−35$, 180 s), vapote
-(90%, +65$/−20$, 45 s), dépanneur (50%, +900$/−50$, 300 s) et sneakers
-(75%, +400$/−25$, 150 s). Les montants ne sont pas tirés au sort.
+Les valeurs sont: colis (85%, +115$/−25$, 20 s), phishing (70%,
++275$/−30$, 25 s), catalyseur (60%, +475$/−35$, 30 s), vapote
+(90%, +65$/−20$, 15 s), dépanneur (50%, +900$/−50$, 30 s) et sneakers
+(75%, +400$/−25$, 25 s). Les cooldowns sont plafonnés à 30 secondes,
+y compris pour les anciens profils. Les montants ne sont pas tirés au sort.
 
 Exemples: `/casino blackjack 500`, `/casino roulette rouge 100` ou
 `/casino roulette 17 20`. Une mise doit être un entier positif et ne peut pas
@@ -92,8 +94,26 @@ paie 1× sur une victoire classique et 1,5× pour un blackjack naturel. Une
 Les niveaux vont de 1 à 60. Le prochain niveau coûte 100 × niveau XP
 (par exemple 100 XP du niveau 1 au 2, puis 200 XP du niveau 2 au 3).
 L'XP est persisté avec les joueurs; la base existante est migrée au lancement.
-Les bonus d'XP des sapes et les bonus de réussite d'équipement sont des valeurs
-de jeu abstraites; le bonus des sapes est le plus élevé parmi les vêtements
+Le catalogue Vêtements & Accessoires comprend plus de 20 pièces supplémentaires,
+réparties entre tête et visage, corps et vestes, accessoires et sacoches, et
+chaussures. Chaque fiche présente son prix, son niveau requis, sa description
+et ses bonus de jeu. Les accessoires de style restent cosmétiques; aucune
+capacité de dissimulation, de stockage ou d'appareil réel n'est simulée.
+La boutique contient aussi une collection luxe (lunettes, vêtements, sacoches,
+montres et bijoux), achetable dans les catégories Vêtements & Accessoires,
+Accessoires et Luxe.
+La catégorie Véhicules propose également douze nouvelles voitures allemandes,
+japonaises, sportives et SUV. Les achats sont débités du solde et apparaissent
+dans l'inventaire du joueur; les descriptions automobiles sont des éléments RP
+et n'activent pas de capacité de conduite réelle.
+Les catégories Armes — Poing, Collection lourde, Collection longue et Protection
+proposent des objets d'arcade fictifs. L'équipement est acheté avec le solde et
+conservé dans l'inventaire; les objets d'arme comptent comme équipement pour les
+défis PVP simulés, et l'équipement de protection ajoute une chance de riposte
+virtuelle. Ces effets sont exclusivement des règles de jeu.
+Les bonus d'XP des vêtements et les bonus de réussite d'équipement sont des
+valeurs de jeu abstraites; le bonus des vêtements est le plus élevé parmi les
+vêtements possédés.
 possédés. Le boîtier OBD est requis pour les défis gamos de niveau 20+.
 Les juggs utilisent une réussite de base de 70%; les bonus d'objets du
 marketplace s'ajoutent au taux, plafonné à 95%. Les niveaux débloquent les

@@ -154,6 +154,26 @@ class ResolveActionTests(unittest.TestCase):
         self.assertEqual(no_counter.outcome, "success")
         self.assertAlmostEqual(no_counter.transfer_rate, 0.33)
 
+    def test_virtual_protection_adds_defense_to_pvp_without_a_weapon(self) -> None:
+        from game import resolve_pvp
+
+        defended = resolve_pvp(
+            attacker_has_weapon=False,
+            victim_has_weapon=False,
+            attack_roll=0.1,
+            counter_roll=0.34,
+            victim_has_armor=True,
+        )
+        not_defended = resolve_pvp(
+            attacker_has_weapon=False,
+            victim_has_weapon=False,
+            attack_roll=0.1,
+            counter_roll=0.35,
+            victim_has_armor=True,
+        )
+        self.assertEqual(defended.outcome, "counter")
+        self.assertEqual(not_defended.outcome, "success")
+
     @patch("game.random.random", return_value=0.69)
     def test_default_roll_uses_random_module(self, random_roll) -> None:
         result = resolve_action("steal_rav4")

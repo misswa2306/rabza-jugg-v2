@@ -32,6 +32,7 @@ from bot import (
     mission_depanneur,
     mission_sneakers,
     prison_remaining_seconds,
+    shop_callback,
 )
 from config import validate_config
 from database import Database
@@ -258,6 +259,189 @@ class GiveCommandTests(unittest.IsolatedAsyncioTestCase):
             "❌ Tu ne peux pas t'envoyer du cash à toi-même."
         )
         database.transfer_cash.assert_not_awaited()
+
+
+class ShopCallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_clothing_category_shows_item_descriptions_and_buy_buttons(self) -> None:
+        database = AsyncMock()
+        database.get_player.return_value = {"level": 1, "cash": 500}
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database})
+        )
+        query = AsyncMock(data="shop:101:vetements_accessoires")
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(
+                id=101,
+                username="joueur",
+                full_name="Joueur",
+                is_bot=False,
+            ),
+            effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
+            effective_message=SimpleNamespace(sender_chat=None),
+        )
+
+        await shop_callback(update, context)
+
+        query.edit_message_text.assert_awaited_once()
+        text = query.edit_message_text.await_args.args[0]
+        self.assertIn("Vêtements & Accessoires", text)
+        self.assertIn("Cagoule Nike Tech noire", text)
+        self.assertIn("Accessoire de sport noir", text)
+        self.assertIn("Montre Rolex Submariner", text)
+        markup = query.edit_message_text.await_args.kwargs["reply_markup"]
+        callback_data = [
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("buy:101:montreal_toque", callback_data)
+
+    async def test_accessory_subcategory_shows_new_items_and_purchase_callback(self) -> None:
+        database = AsyncMock()
+        database.get_player.return_value = {"level": 1, "cash": 500}
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database})
+        )
+        query = AsyncMock(data="shop:101:tete_visage")
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(
+                id=101,
+                username="joueur",
+                full_name="Joueur",
+                is_bot=False,
+            ),
+            effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
+            effective_message=SimpleNamespace(sender_chat=None),
+        )
+
+        await shop_callback(update, context)
+
+        text = query.edit_message_text.await_args.args[0]
+        self.assertIn("Vêtements & Accessoires — Tête & Visage", text)
+        self.assertIn("Cagoule Stealth noire (cosmétique)", text)
+        self.assertIn("Casquette NY dorée", text)
+        markup = query.edit_message_text.await_args.kwargs["reply_markup"]
+        callback_data = [
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("buy:101:stealth_style_balaclava", callback_data)
+
+    async def test_luxury_category_lists_items_with_purchase_buttons(self) -> None:
+        database = AsyncMock()
+        database.get_player.return_value = {"level": 60, "cash": 50000}
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database})
+        )
+        query = AsyncMock(data="shop:101:luxe")
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(
+                id=101,
+                username="joueur",
+                full_name="Joueur",
+                is_bot=False,
+            ),
+            effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
+            effective_message=SimpleNamespace(sender_chat=None),
+        )
+
+        await shop_callback(update, context)
+
+        text = query.edit_message_text.await_args.args[0]
+        self.assertIn("Vêtements & Accessoires — Luxe", text)
+        self.assertIn("Rolex Datejust 41 mm acier et or — 14500$", text)
+        self.assertIn("Le Saint Graal horloger", text)
+        markup = query.edit_message_text.await_args.kwargs["reply_markup"]
+        callback_data = [
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("buy:101:patek_philippe_nautilus", callback_data)
+
+    async def test_vehicle_category_lists_new_cars_and_purchase_buttons(self) -> None:
+        database = AsyncMock()
+        database.get_player.return_value = {"level": 1, "cash": 250000}
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database})
+        )
+        query = AsyncMock(data="shop:101:vehicules")
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(
+                id=101,
+                username="joueur",
+                full_name="Joueur",
+                is_bot=False,
+            ),
+            effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
+            effective_message=SimpleNamespace(sender_chat=None),
+        )
+
+        await shop_callback(update, context)
+
+        text = query.edit_message_text.await_args.args[0]
+        self.assertIn("Véhicules", text)
+        self.assertIn("Audi RS3 Sportback (Nardo Grey) — 45000$", text)
+        self.assertIn("Porsche 911 Turbo S (992) — 195000$", text)
+        self.assertIn("Icône sportive de prestige", text)
+        markup = query.edit_message_text.await_args.kwargs["reply_markup"]
+        callback_data = [
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("buy:101:porsche_911_turbo_s_992", callback_data)
+
+    async def test_weapon_and_protection_categories_are_navigable(self) -> None:
+        database = AsyncMock()
+        database.get_player.return_value = {"level": 1, "cash": 25000}
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database})
+        )
+        query = AsyncMock(data="shop:101:armes_poing")
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(
+                id=101,
+                username="joueur",
+                full_name="Joueur",
+                is_bot=False,
+            ),
+            effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
+            effective_message=SimpleNamespace(sender_chat=None),
+        )
+
+        await shop_callback(update, context)
+
+        text = query.edit_message_text.await_args.args[0]
+        self.assertIn("Armes — Poing (jeu)", text)
+        self.assertIn("Glock 19 Gen 5 — édition arcade — 1200$", text)
+        markup = query.edit_message_text.await_args.kwargs["reply_markup"]
+        callback_data = [
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("buy:101:beretta_m9", callback_data)
+
+        query.data = "shop:101:protection"
+        await shop_callback(update, context)
+
+        text = query.edit_message_text.await_args.args[0]
+        self.assertIn("Protection & Défense (jeu)", text)
+        self.assertIn("Gilet de protection renforcé — niveau III+ (jeu)", text)
+        markup = query.edit_message_text.await_args.kwargs["reply_markup"]
+        callback_data = [
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("buy:101:tactical_vest_level_3", callback_data)
 
 
 class EditCallbackMessageTests(unittest.IsolatedAsyncioTestCase):
@@ -709,7 +893,7 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
         text = message.reply_text.await_args.args[0]
         self.assertIn("/mission_colis", text)
         self.assertIn("/mission_phishing", text)
-        self.assertIn("Cooldown: 60s", text)
+        self.assertIn("Cooldown: 20s", text)
 
     async def test_hustle_pays_fixed_reward_and_enforces_global_cooldown(self) -> None:
         temp_dir, database, context, update, message, chat = await self._setup_hustle(
@@ -728,7 +912,10 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
             context.args = ["vapote"]
             await missions(update, context)
 
-        self.assertIn("Réessaie dans", message.reply_text.await_args.args[0])
+        self.assertRegex(
+            message.reply_text.await_args.args[0],
+            r"Réessaie dans \d+ secondes\.",
+        )
         self.assertEqual(await database.get_player_balance(888, chat.id), 615)
 
     async def test_failed_hustle_can_lose_cash_and_increase_heat(self) -> None:
@@ -775,7 +962,7 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Cash: +275$ | ✨ XP: +0", text)
         self.assertIn("Heat: +0 (0/100)", text)
         self.assertIn("Recherche: +0 (0/100)", text)
-        self.assertIn("Prochain hustle dans 120s", text)
+        self.assertIn("Prochain hustle dans 25s", text)
 
     async def test_hustle_requires_existing_profile_and_supports_anonymous_admin(
         self,
@@ -826,13 +1013,16 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
                 for hustle in HUSTLES
             ],
             [
-                ("colis", 0.85, 115, 25, 60),
-                ("phishing", 0.70, 275, 30, 120),
-                ("catalyseur", 0.60, 475, 35, 180),
-                ("vapote", 0.90, 65, 20, 45),
-                ("depanneur", 0.50, 900, 50, 300),
-                ("sneakers", 0.75, 400, 25, 150),
+                ("colis", 0.85, 115, 25, 20),
+                ("phishing", 0.70, 275, 30, 25),
+                ("catalyseur", 0.60, 475, 35, 30),
+                ("vapote", 0.90, 65, 20, 15),
+                ("depanneur", 0.50, 900, 50, 30),
+                ("sneakers", 0.75, 400, 25, 25),
             ],
+        )
+        self.assertTrue(
+            all(15 <= hustle.cooldown_seconds <= 30 for hustle in HUSTLES)
         )
         self.assertTrue(all(hustle.success_message for hustle in HUSTLES))
 

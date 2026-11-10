@@ -343,7 +343,7 @@ async def help_command(
         "/casino blackjack <mise> — jouer au blackjack\n"
         "/casino roulette <choix> <mise> — jouer à la roulette\n\n"
         "🛍️ Autres commandes\n"
-        "/shop — parcourir la boutique\n"
+        "/shop — Vêtements & Accessoires, véhicules et équipement\n"
         "/inventory — consulter son inventaire\n"
         "/braquer @username — défi PVP fictif (niveau 20+)\n\n"
         "Dans un groupe, tu peux aussi mentionner le bot, par exemple "
@@ -529,7 +529,11 @@ async def handle_game_action(
     await edit_callback_message(
         query,
         f"{result.message}"
-        + (f"\nBonus de sapes inclus; +{xp_gain} XP total." if result.success else "")
+        + (
+            f"\nBonus de vêtements et accessoires inclus; +{xp_gain} XP total."
+            if result.success
+            else ""
+        )
         + "\n\nPour voir tes stats: /profil"
     )
 
@@ -542,14 +546,15 @@ async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keyboard = [
         [
             InlineKeyboardButton(
-                category.title(), callback_data=f"shop:{actor_info['id']}:{category}"
+                SHOP_CATEGORIES[category],
+                callback_data=f"shop:{actor_info['id']}:{category}",
             )
         ]
         for category in SHOP_CATEGORIES
     ]
     await message.reply_text(
-        "🛍️ Marketplace MTL — items fictifs, effets de jeu uniquement. "
-        "Choisis une catégorie:",
+        "🛍️ Boutique MTL — Vêtements & Accessoires, véhicules et équipement "
+        "de jeu. Choisis une catégorie:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -600,10 +605,18 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 )
             ]
         )
+        item_details = "\n\n".join(
+            f"• {item.name} — {item.price}$ (niveau {item.min_level})\n"
+            f"{item.description or 'Objet de style et de progression en jeu.'}\n"
+            f"Bonus: +{item.xp_bonus}% XP, "
+            f"+{item.success_bonus:.0%} réussite"
+            for item in category_items
+        )
         await edit_callback_message(
             query,
-            f"{SHOP_CATEGORIES[category]} | Ton niveau: {player['level']} | "
-            f"Kob: {player['cash']}$",
+            f"🛍️ {SHOP_CATEGORIES[category]}\n"
+            f"Niveau: {player['level']} | Solde: {player['cash']}$\n\n"
+            f"{item_details}",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return
@@ -612,7 +625,7 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         keyboard = [
             [
                 InlineKeyboardButton(
-                    category.title(),
+                    SHOP_CATEGORIES[category],
                     callback_data=f"shop:{actor_info['id']}:{category}",
                 )
             ]
@@ -620,7 +633,8 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         ]
         await edit_callback_message(
             query,
-            "Marketplace MTL: choisis une catégorie.",
+            "Boutique MTL — Vêtements & Accessoires et équipement de jeu. "
+            "Choisis une catégorie:",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return
@@ -636,7 +650,7 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             player = await database.get_player(actor_info["id"], chat.id)
             text = (
                 f"✅ {item.name} ajouté à ton inventaire! "
-                f"Kob restant: {player['cash']}$."
+                f"Kob restant: {player['cash']}$.\n{item.description}"
             )
         elif outcome == "level":
             text = f"Niveau {item.min_level} requis pour {item.name}."
@@ -683,7 +697,7 @@ async def inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     categories: dict[str, list[str]] = {}
     for item in items:
         categories.setdefault(item["category"], []).append(
-            f"• {item['name']} ×{item['quantity']}"
+            f"• {item['name']} ×{item['quantity']} — {item['description']}"
         )
     lines = ["🎒 Inventaire MTL (effets fictifs):"]
     for category, entries in categories.items():
@@ -691,7 +705,9 @@ async def inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.extend(entries)
 
     effects = await database.get_item_effects(actor_info["id"], chat.id)
-    lines.append(f"\nBonus XP max des sapes: +{effects['xp_bonus']}%")
+    lines.append(
+        f"\nBonus XP max Vêtements & Accessoires: +{effects['xp_bonus']}%"
+    )
     lines.append(f"Bonus de réussite abstrait: +{effects['success_bonus']:.0%}")
     lines.append(
         "Boîtier OBD de jeu: "
@@ -743,6 +759,7 @@ async def braquer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     result = resolve_pvp(
         attacker_has_weapon=bool(attacker_effects["has_weapon"]),
         victim_has_weapon=bool(victim_effects["has_weapon"]),
+        victim_has_armor=bool(victim_effects["has_armor"]),
     )
     deadline = (
         prison_deadline(result.prison_seconds)
@@ -768,7 +785,8 @@ async def braquer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif applied["status"] == "counter":
         await message.reply_text(
             f"💥 Riposte de jeu! @{victim['username']} bloque le braquage avec "
-            f"son équipement ({victim_effects['weapon_name']}). "
+            f"son équipement "
+            f"({victim_effects['armor_name'] or victim_effects['weapon_name'] or 'de défense'}). "
             f"Tu prends {PRISON_DURATION_SECONDS} secondes à Bordeaux et verses "
             f"{applied['fine']}$ à "
             f"@{victim['username']}."
@@ -1150,9 +1168,10 @@ async def run_hustle(
         )
         return
     if status == "cooldown":
+        time_unit = "seconde" if remaining == 1 else "secondes"
         await message.reply_text(
             f"⏳ {actor_info['name']}, le quartier a besoin d'une pause. "
-            f"Réessaie dans {remaining}s."
+            f"Réessaie dans {remaining} {time_unit}."
         )
         return
 

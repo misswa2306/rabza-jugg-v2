@@ -9,7 +9,7 @@ from pathlib import Path
 import aiosqlite
 
 from database import Database
-from game import PRISON_DURATION_SECONDS
+from game import ITEMS, PRISON_DURATION_SECONDS, SHOP_CATEGORIES
 
 
 class DatabaseTests(unittest.IsolatedAsyncioTestCase):
@@ -46,12 +46,12 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.database.ensure_player(-100123, "admin anonyme", -100123)
 
         result = await self.database.apply_hustle_result(
-            -100123, -100123, 60, 100, 1
+            -100123, -100123, 20, 100, 1
         )
         self.assertEqual(result, ("ok", 0, 600, 1, 100))
         player = await self.database.get_player(-100123, -100123)
         self.assertGreater(player["last_hustle_time"], 0)
-        self.assertEqual(player["last_hustle_cooldown"], 60)
+        self.assertEqual(player["last_hustle_cooldown"], 20)
 
         blocked = await self.database.apply_hustle_result(
             -100123, -100123, 45, -50, 1
@@ -59,6 +59,34 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocked[0], "cooldown")
         self.assertGreater(blocked[1], 0)
         self.assertEqual(blocked[2:], (600, 1, 0))
+
+    async def test_hustle_cooldowns_are_bounded_including_existing_profiles(self) -> None:
+        await self.database.ensure_player(101, "rabza")
+        async with aiosqlite.connect(self.database.path) as connection:
+            await connection.execute(
+                """
+                UPDATE players
+                SET last_hustle_time = ?, last_hustle_cooldown = 120
+                WHERE user_id = ? AND chat_id = 0
+                """,
+                (time.time(), 101),
+            )
+            await connection.commit()
+
+        blocked = await self.database.apply_hustle_result(101, 0, 120, 100, 0)
+        self.assertEqual(blocked[0], "cooldown")
+        self.assertGreater(blocked[1], 0)
+        self.assertLessEqual(blocked[1], 30)
+
+        async with aiosqlite.connect(self.database.path) as connection:
+            await connection.execute(
+                "UPDATE players SET last_hustle_time = 0 WHERE user_id = ?",
+                (101,),
+            )
+            await connection.commit()
+        await self.database.apply_hustle_result(101, 0, 120, 100, 0)
+        player = await self.database.get_player(101)
+        self.assertEqual(player["last_hustle_cooldown"], 30)
 
     async def test_schema_has_context_scoped_player_and_inventory_keys(self) -> None:
         connection = sqlite3.connect(self.database.path)
@@ -161,15 +189,239 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(effects["has_weapon"])
         self.assertEqual(effects["success_bonus"], 0.11)
         player = await self.database.get_player(303)
-        self.assertEqual(player["cash"], 3000)
+        self.assertEqual(player["cash"], 5300)
 
     async def test_shop_enforces_level_and_insufficient_cash(self) -> None:
         await self.database.ensure_player(404, "nouveau")
-        self.assertEqual(await self.database.purchase_item(404, "glock_19"), "level")
+        self.assertEqual(await self.database.purchase_item(404, "obd_device"), "level")
+        self.assertEqual(await self.database.purchase_item(404, "glock_19"), "cash")
         self.assertEqual(await self.database.purchase_item(404, "tech_fleece"), "ok")
         self.assertEqual(await self.database.purchase_item(404, "tech_fleece"), "ok")
         self.assertEqual(await self.database.purchase_item(404, "tech_fleece"), "cash")
         self.assertEqual(await self.database.purchase_item(404, "unknown"), "missing")
+
+    async def test_weapon_and_protection_catalog_is_purchased_and_applies_pvp_effects(self) -> None:
+        expected = {
+            "glock_19": ("armes_poing", 1200),
+            "beretta_m9": ("armes_poing", 950),
+            "sw_357_magnum": ("armes_poing", 1600),
+            "desert_eagle_50": ("armes_poing", 4500),
+            "mini_uzi_9mm": ("armes_lourdes", 2800),
+            "mac_10": ("armes_lourdes", 3200),
+            "mp5k": ("armes_lourdes", 5000),
+            "thompson_tommy_gun": ("armes_lourdes", 7500),
+            "ak_47": ("armes_longues", 8500),
+            "ar15_custom": ("armes_longues", 11000),
+            "remington_870": ("armes_longues", 2200),
+            "tactical_vest_level_3": ("protection", 1800),
+            "fast_ballistic_helmet": ("protection", 1200),
+        }
+        catalog = {item.item_id: item for item in ITEMS}
+        self.assertTrue(set(expected) <= catalog.keys())
+        self.assertEqual(
+            {item_id: (catalog[item_id].category, catalog[item_id].price)
+             for item_id in expected},
+            expected,
+        )
+        self.assertTrue(all(catalog[item_id].description for item_id in expected))
+
+        await self.database.ensure_player(409, "gear")
+        await self.database.apply_action_result(
+            409, 20000, 0, None, None, xp_gain=19000
+        )
+        self.assertEqual(await self.database.purchase_item(409, "beretta_m9"), "ok")
+        self.assertEqual(
+            await self.database.purchase_item(409, "tactical_vest_level_3"), "ok"
+        )
+        effects = await self.database.get_item_effects(409)
+        inventory = await self.database.get_inventory(409)
+        self.assertTrue(effects["has_weapon"])
+        self.assertEqual(effects["weapon_name"], "Beretta M9 9 mm — édition arcade")
+        self.assertTrue(effects["has_armor"])
+        self.assertEqual(
+            effects["armor_name"], "Gilet de protection renforcé — niveau III+ (jeu)"
+        )
+        self.assertEqual(
+            {item["item_id"] for item in inventory},
+            {"beretta_m9", "tactical_vest_level_3"},
+        )
+
+    async def test_new_clothing_catalog_is_seeded_and_purchases_persist_descriptions(self) -> None:
+        clothing_category = "vetements_accessoires"
+        clothing_categories = {
+            "vetements_accessoires",
+            "tete_visage",
+            "corps_vestes",
+            "accessoires_sacoches",
+            "pieds",
+            "vetement",
+            "accessoire",
+            "luxe",
+        }
+        clothing_items = [
+            item for item in ITEMS if item.category in clothing_categories
+        ]
+        new_item_ids = {
+            "stealth_style_balaclava",
+            "carhartt_paintball_beanie",
+            "gold_ny_cap",
+            "cartier_buffs_sunglasses",
+            "carhartt_canvas_cap",
+            "north_face_700_nuptse",
+            "nike_tech_full_black_windbreaker",
+            "lacoste_classic_tracksuit",
+            "vegan_leather_jacket",
+            "canadiens_retro_91_jersey",
+            "montreal_hockey_scarf",
+            "gucci_lv_crossbody_game",
+            "gucci_gold_buckle_belt",
+            "mile_end_silver_teardrop_chain",
+            "apple_watch_game_replica",
+            "north_face_crossbody_pouch",
+            "silver_hoop_earrings",
+            "tn_shark_blue_black",
+            "air_force_1_pristine_white",
+            "adidas_slides_socks",
+            "winter_boots_montreal",
+            "retro_basketball_sneakers",
+            "cartier_buffs",
+            "prada_sunglasses",
+            "louis_vuitton_millionaire",
+            "gucci_oversized",
+            "moncler_maya",
+            "dior_oblique_puffer",
+            "balenciaga_tracksuit",
+            "off_white_varsity",
+            "palm_angels_track",
+            "lv_discovery_bag",
+            "gucci_gg_belt_bag",
+            "prada_re_edition",
+            "rolex_datejust",
+            "audemars_piguet_royaloak",
+            "cartier_tank",
+            "patek_philippe_nautilus",
+        }
+        luxury_categories = {"vetement", "accessoire", "luxe"}
+        luxury_items = [item for item in ITEMS if item.category in luxury_categories]
+
+        self.assertEqual(SHOP_CATEGORIES[clothing_category], "Vêtements & Accessoires")
+        self.assertTrue(new_item_ids <= {item.item_id for item in clothing_items})
+        self.assertTrue(all(item.description for item in clothing_items))
+        self.assertEqual(len({item.item_id for item in ITEMS}), len(ITEMS))
+        self.assertEqual(
+            {item.item_id for item in luxury_items},
+            new_item_ids - {
+                "stealth_style_balaclava",
+                "carhartt_paintball_beanie",
+                "gold_ny_cap",
+                "cartier_buffs_sunglasses",
+                "carhartt_canvas_cap",
+                "north_face_700_nuptse",
+                "nike_tech_full_black_windbreaker",
+                "lacoste_classic_tracksuit",
+                "vegan_leather_jacket",
+                "canadiens_retro_91_jersey",
+                "montreal_hockey_scarf",
+                "gucci_lv_crossbody_game",
+                "gucci_gold_buckle_belt",
+                "mile_end_silver_teardrop_chain",
+                "apple_watch_game_replica",
+                "north_face_crossbody_pouch",
+                "silver_hoop_earrings",
+                "tn_shark_blue_black",
+                "air_force_1_pristine_white",
+                "adidas_slides_socks",
+                "winter_boots_montreal",
+                "retro_basketball_sneakers",
+            },
+        )
+        self.assertTrue(all(item.description for item in luxury_items))
+        self.assertEqual(SHOP_CATEGORIES["tete_visage"], "Vêtements & Accessoires — Tête & Visage")
+        self.assertEqual(SHOP_CATEGORIES["corps_vestes"], "Vêtements & Accessoires — Corps & Vestes")
+        self.assertEqual(SHOP_CATEGORIES["accessoires_sacoches"], "Vêtements & Accessoires — Accessoires & Sacoches")
+        self.assertEqual(SHOP_CATEGORIES["pieds"], "Vêtements & Accessoires — Pieds")
+        self.assertEqual(
+            SHOP_CATEGORIES["vetement"], "Vêtements & Accessoires — Vêtements"
+        )
+        self.assertEqual(
+            SHOP_CATEGORIES["accessoire"], "Vêtements & Accessoires — Accessoires"
+        )
+        self.assertEqual(SHOP_CATEGORIES["luxe"], "Vêtements & Accessoires — Luxe")
+
+        await self.database.ensure_player(406, "fashion")
+        self.assertEqual(await self.database.purchase_item(406, "montreal_toque"), "ok")
+        self.assertEqual(await self.database.purchase_item(406, "adidas_slides_socks"), "ok")
+        player = await self.database.get_player(406)
+        inventory = await self.database.get_inventory(406)
+
+        self.assertEqual(player["cash"], 325)
+        self.assertEqual(len(inventory), 2)
+        inventory_by_id = {item["item_id"]: item for item in inventory}
+        self.assertEqual(
+            inventory_by_id["montreal_toque"]["category"], clothing_category
+        )
+        self.assertEqual(
+            inventory_by_id["adidas_slides_socks"]["category"], "pieds"
+        )
+        self.assertIn("tuque", inventory_by_id["montreal_toque"]["description"].casefold())
+
+    async def test_luxury_shop_item_is_seeded_and_purchased_atomically(self) -> None:
+        await self.database.ensure_player(407, "luxury")
+        await self.database.apply_action_result(
+            407, 5000, 0, None, None, xp_gain=19000
+        )
+
+        self.assertEqual(await self.database.purchase_item(407, "cartier_buffs"), "ok")
+
+        player = await self.database.get_player(407)
+        inventory = await self.database.get_inventory(407)
+        self.assertEqual(player["cash"], 2000)
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["item_id"], "cartier_buffs")
+        self.assertEqual(inventory[0]["category"], "accessoire")
+        self.assertEqual(inventory[0]["description"], next(
+            item.description for item in ITEMS if item.item_id == "cartier_buffs"
+        ))
+
+    async def test_vehicle_catalog_is_seeded_and_purchases_appear_in_inventory(self) -> None:
+        vehicle_prices = {
+            "audi_rs3_nardo": 45000,
+            "bmw_m3_g80_competition": 68000,
+            "mercedes_c63_amg_w204": 38000,
+            "bmw_m4_f82": 55000,
+            "porsche_911_turbo_s_992": 195000,
+            "honda_civic_si_k24": 12000,
+            "toyota_supra_mk4": 85000,
+            "nissan_skyline_gtr_r34": 120000,
+            "subaru_impreza_wrx_sti": 28000,
+            "mercedes_amg_g63_brabus": 160000,
+            "bmw_x5_m_competition": 82000,
+            "range_rover_sport_svr": 95000,
+        }
+        vehicles = {item.item_id: item for item in ITEMS if item.category == "vehicules"}
+        self.assertTrue(set(vehicle_prices) <= vehicles.keys())
+        self.assertEqual(
+            {item_id: vehicles[item_id].price for item_id in vehicle_prices},
+            vehicle_prices,
+        )
+        self.assertTrue(all(vehicles[item_id].description for item_id in vehicle_prices))
+
+        await self.database.ensure_player(408, "carlover")
+        await self.database.apply_action_result(
+            408, 200000, 0, None, None, xp_gain=19000
+        )
+        self.assertEqual(
+            await self.database.purchase_item(408, "porsche_911_turbo_s_992"),
+            "ok",
+        )
+
+        player = await self.database.get_player(408)
+        inventory = await self.database.get_inventory(408)
+        self.assertEqual(player["cash"], 5500)
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["item_id"], "porsche_911_turbo_s_992")
+        self.assertEqual(inventory[0]["category"], "vehicules")
+        self.assertIn("Icône sportive", inventory[0]["description"])
 
     async def test_shop_equipment_bonuses_are_added_for_juggs(self) -> None:
         await self.database.ensure_player(405, "bonus_items")
@@ -347,7 +599,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         second = await self.database.get_player(2222)
         first_items = await self.database.get_inventory(1111)
         second_items = await self.database.get_inventory(2222)
-        self.assertEqual(first["cash"], 1000)
+        self.assertEqual(first["cash"], 3300)
         self.assertEqual(second["cash"], 500)
         self.assertEqual([item["item_id"] for item in first_items], ["glock_19"])
         self.assertEqual(second_items, [])
@@ -378,7 +630,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         group_inventory = await self.database.get_inventory(user_id, group_chat_id)
         self.assertEqual(private_player["cash"], 500)
         self.assertEqual(private_player["in_prison_until"], 0)
-        self.assertEqual(group_player["cash"], 1000)
+        self.assertEqual(group_player["cash"], 3300)
         self.assertGreater(group_player["in_prison_until"], time.time())
         self.assertEqual(private_inventory, [])
         self.assertEqual([item["item_id"] for item in group_inventory], ["glock_19"])

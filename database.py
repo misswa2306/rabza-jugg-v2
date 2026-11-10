@@ -10,6 +10,10 @@ import aiosqlite
 from game import ITEMS, level_for_xp
 
 
+MIN_HUSTLE_COOLDOWN_SECONDS = 15
+MAX_HUSTLE_COOLDOWN_SECONDS = 30
+
+
 def _epoch_timestamp(value: object) -> float | None:
     """Normalize Unix timestamps and legacy ISO timestamps to epoch seconds."""
     if value is None or value == 0:
@@ -193,10 +197,19 @@ class Database:
                     price INTEGER NOT NULL CHECK (price >= 0),
                     min_level INTEGER NOT NULL CHECK (min_level BETWEEN 1 AND 60),
                     xp_bonus INTEGER NOT NULL DEFAULT 0,
-                    success_bonus REAL NOT NULL DEFAULT 0
+                    success_bonus REAL NOT NULL DEFAULT 0,
+                    description TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
+            cursor = await connection.execute("PRAGMA table_info(items)")
+            item_columns = {row[1] for row in await cursor.fetchall()}
+            if "description" not in item_columns:
+                await connection.execute(
+                    """
+                    ALTER TABLE items ADD COLUMN description TEXT NOT NULL DEFAULT ''
+                    """
+                )
             await connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS inventory (
@@ -213,15 +226,17 @@ class Database:
             await connection.executemany(
                 """
                 INSERT INTO items
-                    (item_id, name, category, price, min_level, xp_bonus, success_bonus)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (item_id, name, category, price, min_level, xp_bonus,
+                     success_bonus, description)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(item_id) DO UPDATE SET
                     name = excluded.name,
                     category = excluded.category,
                     price = excluded.price,
                     min_level = excluded.min_level,
                     xp_bonus = excluded.xp_bonus,
-                    success_bonus = excluded.success_bonus
+                    success_bonus = excluded.success_bonus,
+                    description = excluded.description
                 """,
                 [
                     (
@@ -232,6 +247,7 @@ class Database:
                         item.min_level,
                         item.xp_bonus,
                         item.success_bonus,
+                        item.description,
                     )
                     for item in ITEMS
                 ],
@@ -435,6 +451,10 @@ class Database:
     ) -> tuple[str, int, int, int, int]:
         """Atomically apply a hustle, global cooldown, cash, and search level."""
         now = time.time()
+        cooldown_seconds = min(
+            MAX_HUSTLE_COOLDOWN_SECONDS,
+            max(MIN_HUSTLE_COOLDOWN_SECONDS, int(cooldown_seconds)),
+        )
         async with aiosqlite.connect(self.path) as connection:
             await connection.execute("BEGIN IMMEDIATE")
             connection.row_factory = aiosqlite.Row
@@ -464,7 +484,10 @@ class Database:
                 )
 
             last_hustle_time = float(player["last_hustle_time"] or 0)
-            previous_cooldown = int(player["last_hustle_cooldown"] or 0)
+            previous_cooldown = min(
+                MAX_HUSTLE_COOLDOWN_SECONDS,
+                int(player["last_hustle_cooldown"] or 0),
+            )
             remaining = previous_cooldown - (now - last_hustle_time)
             if last_hustle_time > 0 and remaining > 0:
                 await connection.rollback()
@@ -528,7 +551,7 @@ class Database:
             connection.row_factory = aiosqlite.Row
             cursor = await connection.execute(
                 """
-                SELECT i.item_id, i.name, i.category, i.xp_bonus,
+                SELECT i.item_id, i.name, i.category, i.description, i.xp_bonus,
                        i.success_bonus, inv.quantity
                 FROM inventory AS inv
                 JOIN items AS i ON i.item_id = inv.item_id
@@ -586,7 +609,7 @@ class Database:
 
     async def get_item_effects(
         self, user_id: int, chat_id: int = 0
-    ) -> dict[str, float | int | bool]:
+    ) -> dict[str, float | int | bool | str | None]:
         async with aiosqlite.connect(self.path) as connection:
             cursor = await connection.execute(
                 """
@@ -594,9 +617,14 @@ class Database:
                     COALESCE(MAX(i.xp_bonus), 0),
                     COALESCE(SUM(i.success_bonus), 0),
                     COALESCE(MAX(CASE WHEN i.item_id = 'obd_device' THEN 1 ELSE 0 END), 0),
-                    COALESCE(MAX(CASE WHEN i.item_id IN ('glock_19', 'ak_47') THEN 1 ELSE 0 END), 0),
-                    COALESCE(MAX(CASE WHEN i.item_id = 'ak_47' THEN i.name END),
-                             MAX(CASE WHEN i.item_id = 'glock_19' THEN i.name END))
+                    COALESCE(MAX(CASE WHEN i.category IN
+                        ('armes_poing', 'armes_lourdes', 'armes_longues')
+                        THEN 1 ELSE 0 END), 0),
+                    MAX(CASE WHEN i.category IN
+                        ('armes_poing', 'armes_lourdes', 'armes_longues')
+                        THEN i.name END),
+                    MAX(CASE WHEN i.category = 'protection' THEN 1 ELSE 0 END),
+                    MAX(CASE WHEN i.category = 'protection' THEN i.name END)
                 FROM inventory AS inv
                 JOIN items AS i ON i.item_id = inv.item_id
                 WHERE inv.user_id = ? AND inv.chat_id = ?
@@ -609,6 +637,8 @@ class Database:
                 has_obd,
                 has_weapon,
                 weapon_name,
+                has_armor,
+                armor_name,
             ) = await cursor.fetchone()
             return {
                 "xp_bonus": xp_bonus,
@@ -616,6 +646,8 @@ class Database:
                 "has_obd": bool(has_obd),
                 "has_weapon": bool(has_weapon),
                 "weapon_name": weapon_name,
+                "has_armor": bool(has_armor),
+                "armor_name": armor_name,
             }
 
     async def get_player_by_username(
