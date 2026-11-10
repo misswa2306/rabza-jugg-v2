@@ -14,9 +14,13 @@ sont simulés et ne constituent pas des instructions pour agir dans la vraie vie
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-$env:TELEGRAM_BOT_TOKEN = "TOKEN_FOURNI_PAR_BOTFATHER"
+$env:BOT_TOKEN = "TOKEN_FOURNI_PAR_BOTFATHER"
 python bot.py
 ```
+
+`.env.example` documente les variables requises, mais n'est pas chargé
+automatiquement. Définis `BOT_TOKEN` dans l'environnement avant de démarrer.
+Ne partage pas le fichier `.env` ni le token.
 
 Le fichier SQLite `rabza_jugg_bot.sqlite3` est créé automatiquement au premier
 lancement. Pour choisir un autre chemin, définis `DATABASE_PATH`.
@@ -34,7 +38,7 @@ sans `chat_id` sont conservés dans le contexte privé correspondant à leur
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-export TELEGRAM_BOT_TOKEN="TOKEN_FOURNI_PAR_BOTFATHER"
+export BOT_TOKEN="TOKEN_FOURNI_PAR_BOTFATHER"
 python bot.py
 ```
 
@@ -51,15 +55,29 @@ Ne publie jamais le token dans le code ou dans un dépôt.
 - `/braquer @username` — défi PVP fictif (niveau 20+)
 - `/top` — classement des dix joueurs les plus riches du contexte courant
 - `/prison` — temps restant et option de caution (300$)
+- `/evade` — tentative d'évasion fictive; un échec prolonge la peine
 - `/missions` ou `/mission` — catalogue de missions fictives et récompenses
+- `/mission_colis`, `/mission_phishing`, `/mission_catalyseur`,
+  `/mission_vapote`, `/mission_depanneur` et `/mission_sneakers` — hustles
+  fictifs avec gains aléatoires, amende possible au sens du jeu et hausse de
+  l'indice de recherche en cas d'échec
 - `/casino` — menu du casino fictif (blackjack et roulette)
 
 Dans les groupes, les commandes acceptent aussi la mention du bot, par exemple
-`/help@rabza_destroy_bot` et `/casino@rabza_destroy_bot`.
+`/help@Rabza_Jugg_V2_bot` et `/casino@Rabza_Jugg_V2_bot`.
 
 Les missions se lancent avec un identifiant, par exemple `/mission civic`.
 Elles sont débloquées par niveau, accordent du cash et de l'XP en cas de
 réussite, et peuvent entraîner une amende ou une peine de jeu en cas d'échec.
+Le menu `/missions` affiche aussi les hustles disponibles. Chaque hustle a
+son taux de réussite, sa plage de gains et son cooldown. Le cooldown global
+persistant est enregistré avec le profil du joueur dans chaque conversation.
+Les profils existants sont migrés pour conserver le cash, le niveau et le XP,
+et ajouter l'indice de recherche ainsi que l'horodatage du dernier hustle.
+Les gains et probabilités sont: colis (85%, 80–150$, 60 s), phishing fictif
+(70%, 150–400$, 120 s), catalyseur (60%, 300–650$, 180 s), vapote (90%,
+40–90$, 45 s), dépanneur (50%, 600–1200$, 300 s) et sneakers (75%,
+250–550$, 150 s).
 
 Exemples: `/casino blackjack 500`, `/casino roulette rouge 100` ou
 `/casino roulette 17 20`. Une mise doit être un entier positif et ne peut pas

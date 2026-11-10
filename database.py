@@ -65,11 +65,16 @@ class Database:
                         user_id INTEGER NOT NULL,
                         username TEXT,
                         cash INTEGER NOT NULL DEFAULT 500 CHECK (cash >= 0),
+                        balance INTEGER GENERATED ALWAYS AS (cash) VIRTUAL,
                         heat INTEGER NOT NULL DEFAULT 0 CHECK (heat BETWEEN 0 AND 100),
                         in_prison_until REAL NOT NULL DEFAULT 0,
                         gamos TEXT NOT NULL DEFAULT 'Aucun',
                         level INTEGER NOT NULL DEFAULT 1 CHECK (level BETWEEN 1 AND 60),
                         xp INTEGER NOT NULL DEFAULT 0 CHECK (xp >= 0),
+                        search_level INTEGER NOT NULL DEFAULT 0
+                            CHECK (search_level BETWEEN 0 AND 100),
+                        last_hustle_time REAL NOT NULL DEFAULT 0,
+                        last_hustle_cooldown INTEGER NOT NULL DEFAULT 0,
                         PRIMARY KEY (chat_id, user_id)
                     )
                     """
@@ -80,14 +85,33 @@ class Database:
                 legacy_columns = {row[1] for row in await cursor.fetchall()}
                 level_column = "level" if "level" in legacy_columns else "1"
                 xp_column = "xp" if "xp" in legacy_columns else "0"
+                search_level_column = (
+                    "search_level"
+                    if "search_level" in legacy_columns
+                    else ("heat" if "heat" in legacy_columns else "0")
+                )
+                last_hustle_column = (
+                    "last_hustle_time"
+                    if "last_hustle_time" in legacy_columns
+                    else "0"
+                )
+                last_hustle_cooldown_column = (
+                    "last_hustle_cooldown"
+                    if "last_hustle_cooldown" in legacy_columns
+                    else "0"
+                )
                 await connection.execute(
                     f"""
                     INSERT INTO players
                         (chat_id, user_id, username, cash, heat,
-                         in_prison_until, gamos, level, xp)
+                         in_prison_until, gamos, level, xp,
+                         search_level, last_hustle_time,
+                         last_hustle_cooldown)
                     SELECT user_id, user_id, username, cash, heat,
                            COALESCE(in_prison_until, 0), gamos,
-                           {level_column}, {xp_column}
+                           {level_column}, {xp_column},
+                           {search_level_column}, {last_hustle_column},
+                           {last_hustle_cooldown_column}
                     FROM players_legacy
                     """
                 )
@@ -99,13 +123,51 @@ class Database:
                         user_id INTEGER NOT NULL,
                         username TEXT,
                         cash INTEGER NOT NULL DEFAULT 500 CHECK (cash >= 0),
+                        balance INTEGER GENERATED ALWAYS AS (cash) VIRTUAL,
                         heat INTEGER NOT NULL DEFAULT 0 CHECK (heat BETWEEN 0 AND 100),
                         in_prison_until REAL NOT NULL DEFAULT 0,
                         gamos TEXT NOT NULL DEFAULT 'Aucun',
                         level INTEGER NOT NULL DEFAULT 1 CHECK (level BETWEEN 1 AND 60),
                         xp INTEGER NOT NULL DEFAULT 0 CHECK (xp >= 0),
+                        search_level INTEGER NOT NULL DEFAULT 0
+                            CHECK (search_level BETWEEN 0 AND 100),
+                        last_hustle_time REAL NOT NULL DEFAULT 0,
+                        last_hustle_cooldown INTEGER NOT NULL DEFAULT 0,
                         PRIMARY KEY (chat_id, user_id)
                     )
+                    """
+                )
+            cursor = await connection.execute("PRAGMA table_xinfo(players)")
+            player_columns = {row[1] for row in await cursor.fetchall()}
+            if "balance" not in player_columns:
+                await connection.execute(
+                    """
+                    ALTER TABLE players
+                    ADD COLUMN balance INTEGER GENERATED ALWAYS AS (cash) VIRTUAL
+                    """
+                )
+            if "search_level" not in player_columns:
+                await connection.execute(
+                    """
+                    ALTER TABLE players ADD COLUMN search_level INTEGER
+                    NOT NULL DEFAULT 0 CHECK (search_level BETWEEN 0 AND 100)
+                    """
+                )
+                await connection.execute(
+                    "UPDATE players SET search_level = heat"
+                )
+            if "last_hustle_time" not in player_columns:
+                await connection.execute(
+                    """
+                    ALTER TABLE players ADD COLUMN last_hustle_time REAL
+                    NOT NULL DEFAULT 0
+                    """
+                )
+            if "last_hustle_cooldown" not in player_columns:
+                await connection.execute(
+                    """
+                    ALTER TABLE players ADD COLUMN last_hustle_cooldown INTEGER
+                    NOT NULL DEFAULT 0
                     """
                 )
             await connection.execute(
@@ -200,8 +262,13 @@ class Database:
         async with aiosqlite.connect(self.path) as connection:
             connection.row_factory = aiosqlite.Row
             cursor = await connection.execute(
-                "SELECT user_id, username, cash, heat, in_prison_until, gamos, level, xp "
-                "FROM players WHERE user_id = ? AND chat_id = ?",
+                """
+                SELECT user_id, username, cash, balance, heat,
+                       in_prison_until, gamos,
+                       level, xp, search_level, last_hustle_time,
+                       last_hustle_cooldown
+                FROM players WHERE user_id = ? AND chat_id = ?
+                """,
                 (user_id, chat_id),
             )
             row = await cursor.fetchone()
@@ -322,6 +389,7 @@ class Database:
                 UPDATE players
                 SET cash = MAX(0, cash + ?),
                     heat = MIN(100, MAX(0, heat + ?)),
+                    search_level = MIN(100, MAX(0, search_level + ?)),
                     gamos = COALESCE(?, gamos),
                     in_prison_until = ?,
                     xp = ?,
@@ -330,6 +398,7 @@ class Database:
                 """,
                 (
                     cash_delta,
+                    heat_delta,
                     heat_delta,
                     gamos,
                     new_prison_until,
@@ -341,6 +410,102 @@ class Database:
             )
             await connection.commit()
             return True
+
+    async def apply_hustle_result(
+        self,
+        user_id: int,
+        chat_id: int,
+        cooldown_seconds: int,
+        cash_delta: int,
+        search_level_delta: int,
+    ) -> tuple[str, int, int, int, int]:
+        """Atomically apply a hustle, global cooldown, cash, and search level."""
+        now = time.time()
+        async with aiosqlite.connect(self.path) as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                """
+                SELECT cash, heat, search_level, in_prison_until,
+                       last_hustle_time, last_hustle_cooldown
+                FROM players
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (user_id, chat_id),
+            )
+            player = await cursor.fetchone()
+            if player is None:
+                await connection.rollback()
+                return "missing", 0, 0, 0, 0
+
+            prison_until = _epoch_timestamp(player["in_prison_until"])
+            if prison_until is not None and prison_until > now:
+                await connection.rollback()
+                return (
+                    "prison",
+                    max(1, int(prison_until - now)),
+                    int(player["cash"]),
+                    int(player["search_level"]),
+                    0,
+                )
+
+            last_hustle_time = float(player["last_hustle_time"] or 0)
+            previous_cooldown = int(player["last_hustle_cooldown"] or 0)
+            remaining = previous_cooldown - (now - last_hustle_time)
+            if last_hustle_time > 0 and remaining > 0:
+                await connection.rollback()
+                return (
+                    "cooldown",
+                    max(1, int(remaining + 0.999)),
+                    int(player["cash"]),
+                    int(player["search_level"]),
+                    0,
+                )
+
+            actual_cash_delta = cash_delta
+            if cash_delta < 0:
+                actual_cash_delta = max(-int(player["cash"]), cash_delta)
+            new_search_level = min(
+                100,
+                max(0, int(player["search_level"]) + search_level_delta),
+            )
+            new_heat = min(
+                100,
+                max(0, int(player["heat"]) + search_level_delta),
+            )
+            await connection.execute(
+                """
+                UPDATE players SET cash = cash + ?, heat = ?,
+                    search_level = ?, last_hustle_time = ?,
+                    last_hustle_cooldown = ?
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (
+                    actual_cash_delta,
+                    new_heat,
+                    new_search_level,
+                    now,
+                    cooldown_seconds,
+                    user_id,
+                    chat_id,
+                ),
+            )
+            cursor = await connection.execute(
+                "SELECT cash FROM players WHERE user_id = ? AND chat_id = ?",
+                (user_id, chat_id),
+            )
+            updated_player = await cursor.fetchone()
+            if updated_player is None:
+                await connection.rollback()
+                return "missing", 0, 0, 0, 0
+            await connection.commit()
+            return (
+                "ok",
+                0,
+                int(updated_player["cash"]),
+                new_search_level,
+                actual_cash_delta,
+            )
 
     async def get_inventory(
         self, user_id: int, chat_id: int = 0
@@ -606,3 +771,73 @@ class Database:
             )
             await connection.commit()
             return True
+
+    async def try_escape(
+        self,
+        user_id: int,
+        chat_id: int,
+        success: bool,
+        failure_seconds: int = 30,
+        search_increase: int = 5,
+    ) -> tuple[str, int, int]:
+        """Resolve a fictional escape attempt atomically with the prison state."""
+        now = time.time()
+        async with aiosqlite.connect(self.path) as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                """
+                SELECT in_prison_until, heat, search_level FROM players
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (user_id, chat_id),
+            )
+            player = await cursor.fetchone()
+            if player is None:
+                await connection.rollback()
+                return "missing", 0, 0
+            deadline = _epoch_timestamp(player["in_prison_until"])
+            if deadline is None:
+                await connection.rollback()
+                return "free", 0, int(player["search_level"])
+            if deadline <= now:
+                await connection.execute(
+                    """
+                    UPDATE players SET in_prison_until = 0
+                    WHERE user_id = ? AND chat_id = ?
+                    """,
+                    (user_id, chat_id),
+                )
+                await connection.commit()
+                return "expired", 0, int(player["search_level"])
+
+            if success:
+                await connection.execute(
+                    """
+                    UPDATE players SET in_prison_until = 0
+                    WHERE user_id = ? AND chat_id = ?
+                    """,
+                    (user_id, chat_id),
+                )
+                await connection.commit()
+                return "escaped", 0, int(player["search_level"])
+
+            new_deadline = max(deadline, now) + failure_seconds
+            new_heat = min(100, int(player["heat"]) + search_increase)
+            new_search_level = min(
+                100, int(player["search_level"]) + search_increase
+            )
+            await connection.execute(
+                """
+                UPDATE players
+                SET in_prison_until = ?, heat = ?, search_level = ?
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (new_deadline, new_heat, new_search_level, user_id, chat_id),
+            )
+            await connection.commit()
+            return (
+                "failed",
+                max(1, int(new_deadline - now)),
+                new_search_level,
+            )

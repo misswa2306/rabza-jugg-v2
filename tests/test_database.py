@@ -24,7 +24,11 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.database.ensure_player(101, "rabza")
         player = await self.database.get_player(101)
         self.assertEqual(player["cash"], 500)
+        self.assertEqual(player["balance"], 500)
         self.assertEqual(player["heat"], 0)
+        self.assertEqual(player["search_level"], 0)
+        self.assertEqual(player["last_hustle_time"], 0)
+        self.assertEqual(player["last_hustle_cooldown"], 0)
         self.assertEqual(player["gamos"], "Aucun")
 
         applied = await self.database.apply_action_result(
@@ -34,13 +38,32 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         player = await self.database.get_player(101)
         self.assertEqual(player["cash"], 850)
         self.assertEqual(player["heat"], 12)
+        self.assertEqual(player["search_level"], 12)
         self.assertEqual(player["gamos"], "RAV4")
+
+    async def test_hustle_cooldown_is_atomic_and_global_to_the_player(self) -> None:
+        await self.database.ensure_player(-100123, "admin anonyme", -100123)
+
+        result = await self.database.apply_hustle_result(
+            -100123, -100123, 60, 100, 1
+        )
+        self.assertEqual(result, ("ok", 0, 600, 1, 100))
+        player = await self.database.get_player(-100123, -100123)
+        self.assertGreater(player["last_hustle_time"], 0)
+        self.assertEqual(player["last_hustle_cooldown"], 60)
+
+        blocked = await self.database.apply_hustle_result(
+            -100123, -100123, 45, -50, 1
+        )
+        self.assertEqual(blocked[0], "cooldown")
+        self.assertGreater(blocked[1], 0)
+        self.assertEqual(blocked[2:], (600, 1, 0))
 
     async def test_schema_has_context_scoped_player_and_inventory_keys(self) -> None:
         connection = sqlite3.connect(self.database.path)
         try:
             player_columns = connection.execute(
-                "PRAGMA table_info(players)"
+                "PRAGMA table_xinfo(players)"
             ).fetchall()
             inventory_columns = connection.execute(
                 "PRAGMA table_info(inventory)"
@@ -67,6 +90,15 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             inventory_primary_key, ["chat_id", "user_id", "item_id"]
         )
         self.assertTrue({"players", "items", "inventory"} <= tables)
+        self.assertTrue(
+            {
+                "balance",
+                "search_level",
+                "last_hustle_time",
+                "last_hustle_cooldown",
+            }
+            <= {row[1] for row in player_columns}
+        )
 
     async def test_prison_blocks_actions_and_bail_releases_player(self) -> None:
         await self.database.ensure_player(202, "en_taupe")
@@ -83,6 +115,26 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         player = await self.database.get_player(202)
         self.assertEqual(player["cash"], 200)
+        self.assertEqual(player["in_prison_until"], 0)
+
+    async def test_escape_failure_extends_sentence_and_success_releases_player(self) -> None:
+        await self.database.ensure_player(212, "escape")
+        await self.database.apply_action_result(
+            212, 0, 0, None, time.time() + 60
+        )
+
+        result, remaining, search = await self.database.try_escape(
+            212, 0, success=False
+        )
+        player = await self.database.get_player(212)
+        self.assertEqual(result, "failed")
+        self.assertGreaterEqual(remaining, 89)
+        self.assertEqual(search, 5)
+        self.assertEqual(player["search_level"], 5)
+
+        result, _, _ = await self.database.try_escape(212, 0, success=True)
+        player = await self.database.get_player(212)
+        self.assertEqual(result, "escaped")
         self.assertEqual(player["in_prison_until"], 0)
 
     async def test_leaderboard_is_ordered_by_cash(self) -> None:

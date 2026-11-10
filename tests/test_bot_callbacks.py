@@ -10,6 +10,7 @@ from telegram.error import BadRequest
 from telegram.ext import CommandHandler
 
 from bot import (
+    HUSTLES,
     blackjack_hand_value,
     braquer,
     casino,
@@ -18,7 +19,16 @@ from bot import (
     handle_game_action,
     player_context,
     missions,
+    missions_command,
+    mission_command,
+    casino_command,
     profil,
+    mission_colis,
+    mission_phishing,
+    mission_catalyseur,
+    mission_vapote,
+    mission_depanneur,
+    mission_sneakers,
     prison_remaining_seconds,
 )
 from config import validate_config
@@ -26,6 +36,24 @@ from database import Database
 
 
 class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_command_aliases_await_the_existing_handlers(self) -> None:
+        update = SimpleNamespace()
+        context = SimpleNamespace()
+
+        with (
+            patch("bot.casino", new_callable=AsyncMock) as casino_handler,
+            patch("bot.missions", new_callable=AsyncMock) as missions_handler,
+        ):
+            await casino_command(update, context)
+            casino_handler.assert_awaited_once_with(update, context)
+
+            await missions_command(update, context)
+            missions_handler.assert_awaited_once_with(update, context)
+
+            missions_handler.reset_mock()
+            await mission_command(update, context)
+            missions_handler.assert_awaited_once_with(update, context)
+
     async def test_help_lists_all_registered_command_families(self) -> None:
         message = SimpleNamespace(reply_text=AsyncMock())
         await help_command(SimpleNamespace(effective_message=message), None)
@@ -37,11 +65,18 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
             "/casino",
             "/missions",
             "/mission",
+            "/mission_colis",
+            "/mission_phishing",
+            "/mission_catalyseur",
+            "/mission_vapote",
+            "/mission_depanneur",
+            "/mission_sneakers",
             "/help",
             "/jugg",
             "/braquer",
             "/shop",
             "/prison",
+            "/evade",
             "/inventory",
             "/top",
         ):
@@ -54,7 +89,7 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
             id=123456,
             is_bot=True,
             first_name="Rabza",
-            username="rabza_destroy_bot",
+            username="Rabza_Jugg_V2_bot",
         )
         command_handlers = [
             CommandHandler(command, help_command)
@@ -64,6 +99,12 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
                 "casino",
                 "missions",
                 "mission",
+                "mission_colis",
+                "mission_phishing",
+                "mission_catalyseur",
+                "mission_vapote",
+                "mission_depanneur",
+                "mission_sneakers",
                 "help",
                 "jugg",
                 "braquer",
@@ -75,7 +116,7 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         for command_handler in command_handlers:
-            for mention in ("", "@rabza_destroy_bot"):
+            for mention in ("", "@Rabza_Jugg_V2_bot"):
                 with self.subTest(command=command_handler.commands, mention=mention):
                     text = f"/{next(iter(command_handler.commands))}{mention}"
                     update = Update.de_json(
@@ -400,6 +441,7 @@ class MissionTests(unittest.IsolatedAsyncioTestCase):
             effective_chat=chat,
             effective_message=message,
         )
+        await database.ensure_player(777, "mission_player", chat.id)
         return temp_dir, database, context, update, message, chat
 
     async def test_mission_list_displays_all_missions_and_rewards(self) -> None:
@@ -460,6 +502,158 @@ class MissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(player["in_prison_until"], 0)
         self.assertIn("Mission échouée", message.reply_text.await_args.args[0])
         self.assertIn("Amende: -50$", message.reply_text.await_args.args[0])
+
+
+class HustleTests(unittest.IsolatedAsyncioTestCase):
+    async def _setup_hustle(self, args: list[str], register: bool = True):
+        temp_dir = TemporaryDirectory()
+        database = Database(str(Path(temp_dir.name) / "hustles.sqlite3"))
+        await database.initialize()
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database}),
+            args=args,
+        )
+        message = SimpleNamespace(reply_text=AsyncMock(), sender_chat=None)
+        chat = SimpleNamespace(id=-100888, type="supergroup")
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=888,
+                username="hustle_player",
+                full_name="Hustle Player",
+                is_bot=False,
+            ),
+            effective_chat=chat,
+            effective_message=message,
+        )
+        if register:
+            await database.ensure_player(888, "hustle_player", chat.id)
+        return temp_dir, database, context, update, message, chat
+
+    async def test_dedicated_hustle_commands_dispatch_the_matching_mission(self) -> None:
+            update = SimpleNamespace()
+            context = SimpleNamespace()
+            commands = (
+                mission_colis,
+                mission_phishing,
+                mission_catalyseur,
+                mission_vapote,
+                mission_depanneur,
+                mission_sneakers,
+            )
+            with patch("bot.hustle_command", new_callable=AsyncMock) as hustle_command:
+                for command, hustle in zip(commands, HUSTLES):
+                    await command(update, context)
+                    hustle_command.assert_awaited_with(update, context, hustle)
+                    hustle_command.reset_mock()
+
+    async def test_mission_menu_lists_hustles_and_cooldowns(self) -> None:
+        temp_dir, _, context, update, message, _ = await self._setup_hustle([])
+        self.addCleanup(temp_dir.cleanup)
+
+        await missions(update, context)
+
+        text = message.reply_text.await_args.args[0]
+        self.assertIn("/mission_colis", text)
+        self.assertIn("/mission_phishing", text)
+        self.assertIn("Cooldown: 60s", text)
+
+    async def test_hustle_pays_random_reward_and_enforces_global_cooldown(self) -> None:
+        temp_dir, database, context, update, message, chat = await self._setup_hustle(
+            ["colis"]
+        )
+        self.addCleanup(temp_dir.cleanup)
+
+        with (
+            patch("bot.random.random", return_value=0.0),
+            patch("bot.random.randint", return_value=100),
+        ):
+            await missions(update, context)
+            self.assertEqual(await database.get_player_balance(888, chat.id), 600)
+
+            message.reply_text.reset_mock()
+            context.args = ["vapote"]
+            await missions(update, context)
+
+        self.assertIn("Réessaie dans", message.reply_text.await_args.args[0])
+        self.assertEqual(await database.get_player_balance(888, chat.id), 600)
+
+    async def test_failed_hustle_can_lose_cash_and_increase_heat(self) -> None:
+        temp_dir, database, context, update, message, chat = await self._setup_hustle(
+            ["depanneur"]
+        )
+        self.addCleanup(temp_dir.cleanup)
+
+        with (
+            patch("bot.random.random", side_effect=[0.99, 0.0, 0.0]),
+            patch("bot.random.randint", side_effect=[30, 7]),
+        ):
+            await missions(update, context)
+
+        player = await database.get_player(888, chat.id)
+        self.assertEqual(player["cash"], 470)
+        self.assertEqual(player["heat"], 1)
+        text, = message.reply_text.await_args.args
+        self.assertIn("indice de recherche <b>+1</b>", text)
+        self.assertEqual(player["search_level"], 1)
+        self.assertEqual(message.reply_text.await_args.kwargs["parse_mode"], "HTML")
+
+    async def test_hustle_requires_existing_profile_and_supports_anonymous_admin(
+        self,
+    ) -> None:
+        temp_dir, database, context, update, message, chat = await self._setup_hustle(
+            []
+        )
+        self.addCleanup(temp_dir.cleanup)
+
+        await database.ensure_player(chat.id, "Admin anonyme", chat.id)
+        message.sender_chat = SimpleNamespace(id=chat.id, title="Admin anonyme")
+        update.effective_user = None
+        context.args = []
+        with (
+            patch("bot.random.random", return_value=0.0),
+            patch("bot.random.randint", return_value=100),
+        ):
+            await mission_colis(update, context)
+
+        player = await database.get_player(chat.id, chat.id)
+        self.assertEqual(player["cash"], 600)
+        self.assertIn("Livraison de colis", message.reply_text.await_args.args[0])
+
+    async def test_hustle_handlers_require_start_for_unregistered_player(self) -> None:
+        temp_dir, _, context, update, message, _ = await self._setup_hustle(
+            [], register=False
+        )
+        self.addCleanup(temp_dir.cleanup)
+
+        await mission_colis(update, context)
+
+        self.assertIn("/start", message.reply_text.await_args.args[0])
+
+    async def test_hustle_definitions_match_requested_rates_rewards_and_cooldowns(
+        self,
+    ) -> None:
+        from bot import HUSTLES
+
+        self.assertEqual(
+            [
+                (
+                    hustle.mission_id,
+                    hustle.success_chance,
+                    hustle.reward_min,
+                    hustle.reward_max,
+                    hustle.cooldown_seconds,
+                )
+                for hustle in HUSTLES
+            ],
+            [
+                ("colis", 0.85, 80, 150, 60),
+                ("phishing", 0.70, 150, 400, 120),
+                ("catalyseur", 0.60, 300, 650, 180),
+                ("vapote", 0.90, 40, 90, 45),
+                ("depanneur", 0.50, 600, 1200, 300),
+                ("sneakers", 0.75, 250, 550, 150),
+            ],
+        )
 
 
 class BlackjackHandTests(unittest.TestCase):
@@ -599,7 +793,7 @@ class ConfigurationTests(unittest.TestCase):
     def test_missing_botfather_token_fails_with_clear_configuration_error(self) -> None:
         with patch("config.BOT_TOKEN", ""):
             with self.assertRaisesRegex(
-                RuntimeError, "TELEGRAM_BOT_TOKEN est absente"
+                RuntimeError, "BOT_TOKEN est absente"
             ):
                 validate_config()
 

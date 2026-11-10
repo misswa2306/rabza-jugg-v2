@@ -1,6 +1,7 @@
 """Telegram entry point for Rabza Jugg V2."""
 
 import asyncio
+from html import escape
 import logging
 import random
 from dataclasses import dataclass
@@ -66,6 +67,16 @@ class MissionSpec:
     success_chance: float
 
 
+@dataclass(frozen=True)
+class HustleSpec:
+    mission_id: str
+    name: str
+    success_chance: float
+    reward_min: int
+    reward_max: int
+    cooldown_seconds: int
+
+
 MISSIONS = (
     MissionSpec("civic", "Vol de civic rouillée dans une ruelle", 1, 100, 20, 0.85),
     MissionSpec(
@@ -102,6 +113,57 @@ MISSIONS = (
     ),
 )
 
+HUSTLES = (
+    HustleSpec(
+        "colis",
+        "Livraison de colis louches (Plateau → St-Léonard)",
+        0.85,
+        80,
+        150,
+        60,
+    ),
+    HustleSpec(
+        "phishing",
+        "Faux support technique / SMS bancaires (mission fictive)",
+        0.70,
+        150,
+        400,
+        120,
+    ),
+    HustleSpec(
+        "catalyseur",
+        "Vol de pot catalytique sur une Civic (jeu fictif)",
+        0.60,
+        300,
+        650,
+        180,
+    ),
+    HustleSpec(
+        "vapote",
+        "Revente de puffs au Cégep (mission fictive)",
+        0.90,
+        40,
+        90,
+        45,
+    ),
+    HustleSpec(
+        "depanneur",
+        "Braquage d'un dépanneur de quartier (jeu fictif)",
+        0.50,
+        600,
+        1200,
+        300,
+    ),
+    HustleSpec(
+        "sneakers",
+        "Mule de fausses Jordans (mission fictive)",
+        0.75,
+        250,
+        550,
+        150,
+    ),
+)
+
 
 ROULETTE_RED_NUMBERS = frozenset(
     {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
@@ -130,8 +192,9 @@ async def player_context(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     actor_override: ActorInfo | None = None,
+    ensure_player: bool = True,
 ) -> tuple[ActorInfo, Chat, Message] | None:
-    """Resolve this message's actor and ensure its player account."""
+    """Resolve this message's actor and optionally ensure its player account."""
     user = update.effective_user
     chat = update.effective_chat
     message = update.effective_message
@@ -158,9 +221,10 @@ async def player_context(
             "username": sender_chat.title or "Admin Anonyme",
         }
 
-    await database_for(context).ensure_player(
-        actor_info["id"], actor_info["username"], chat.id
-    )
+    if ensure_player:
+        await database_for(context).ensure_player(
+            actor_info["id"], actor_info["username"], chat.id
+        )
     return actor_info, chat, message
 
 
@@ -272,6 +336,21 @@ def find_mission(query: str) -> MissionSpec | None:
     )
 
 
+def find_hustle(query: str) -> HustleSpec | None:
+    normalized_query = query.casefold().strip()
+    return next(
+        (
+            hustle
+            for hustle in HUSTLES
+            if normalized_query in {
+                hustle.mission_id,
+                hustle.name.casefold(),
+            }
+        ),
+        None,
+    )
+
+
 async def post_init(application: Application) -> None:
     database = Database(DATABASE_PATH)
     await database.initialize()
@@ -284,10 +363,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     message = actor[2]
     await message.reply_text(
-        "Wesh l'équipe, bienvenue sur le Rabza Jugg V2! "
-        "Montréal t'attend: gamos, kichta et décisions douteuses — "
-        "tout ça dans un jeu fictif, c'est carré. T'as 500$ pour commencer.\n\n"
-        "Tape /profil pour checker ton statut ou /jugg pour choisir ton move."
+        "🎮 Wesh l'équipe, bienvenue sur le Rabza Jugg V2!\n"
+        "Montréal t'attend: gamos, kichta et missions d'arcade — tout est "
+        "fictif et les résultats sont déterminés aléatoirement.\n\n"
+        "📜 Règles: commence avec 500$, gagne de l'XP pour monter de niveau, "
+        "gère ton cash et ton indice de recherche. Les missions ont des "
+        "cooldowns; certains échecs peuvent entraîner une amende ou une peine "
+        "de jeu. /prison propose la caution (option avocat), /evade une "
+        "tentative d'évasion aléatoire.\n\n"
+        "Tape /help pour toutes les commandes ou /profil pour voir tes stats."
     )
 
 
@@ -303,11 +387,18 @@ async def help_command(
         "/start — démarrer le bot\n"
         "/profil — consulter cash, niveau, XP et statut\n"
         "/top — classement du groupe\n"
-        "/prison — consulter sa peine et payer la caution\n\n"
+        "/prison — consulter sa peine et payer la caution (avocat)\n"
+        "/evade — tenter une évasion fictive si tu es en taule\n\n"
         "🎯 Jeux d'arcade\n"
         "/jugg — choisir un défi d'arcade\n"
         "/missions — afficher les missions et les niveaux requis\n"
         "/mission <id> — lancer une mission (ex. /mission civic)\n"
+        "/mission_colis — livraison de colis (60s)\n"
+        "/mission_phishing — hustle fictif (120s)\n"
+        "/mission_catalyseur — hustle fictif (180s)\n"
+        "/mission_vapote — hustle fictif (45s)\n"
+        "/mission_depanneur — hustle fictif (300s)\n"
+        "/mission_sneakers — hustle fictif (150s)\n"
         "/casino — afficher les règles et les jeux\n"
         "/casino blackjack <mise> — jouer au blackjack\n"
         "/casino roulette <choix> <mise> — jouer à la roulette\n\n"
@@ -316,7 +407,7 @@ async def help_command(
         "/inventory — consulter son inventaire\n"
         "/braquer @username — défi PVP fictif (niveau 20+)\n\n"
         "Dans un groupe, tu peux aussi mentionner le bot, par exemple "
-        "/casino@rabza_destroy_bot ou /help@rabza_destroy_bot."
+        "/casino@Rabza_Jugg_V2_bot ou /help@Rabza_Jugg_V2_bot."
     )
 
 
@@ -332,6 +423,12 @@ async def profil(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Le joueur {actor_info['id']} est introuvable après son enregistrement."
         )
 
+    items = await database.get_inventory(actor_info["id"], chat.id)
+    inventory_text = (
+        ", ".join(f"{item['name']} ×{item['quantity']}" for item in items)
+        if items
+        else "vide"
+    )
     remaining_seconds = prison_remaining_seconds(player)
     if remaining_seconds:
         status = f"En taule à Bordeaux/RDP — encore {remaining_seconds} s"
@@ -345,9 +442,11 @@ async def profil(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"💵 Kob: {player['cash']}$\n"
         f"🚘 Gamos: {player['gamos']}\n"
         f"🔥 Heat: {player['heat']}/100\n"
+        f"🚨 Recherche: {player['search_level']}/100\n"
         f"⭐ Rang MTL: niveau {player['level']}/{MAX_LEVEL}\n"
         f"✨ XP: {player['xp']} (prochain niveau: "
         f"{xp_to_next_level(player['xp'], player['level'])} XP)\n"
+        f"🎒 Inventaire: {inventory_text}\n"
         f"🚔 Statut: {status}"
     )
 
@@ -798,25 +897,55 @@ async def prison(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_text(
         f"T'es encore à Bordeaux/RDP pour {remaining_seconds} seconde(s). "
         f"T'as {player['cash']}$; la caution coûte {BAIL_COST}$. "
-        "La patience ou la kichta, à toi de voir.",
+        "Un avocat peut payer la caution; sinon attends ou tente /evade "
+        "(issue aléatoire, 100% dans le jeu).",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
-async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def evade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = await player_context(update, context)
+    if actor is None:
+        return
+    actor_info, chat, message = actor
+    success = random.random() < 0.25
+    result, remaining, search_level = await database_for(context).try_escape(
+        actor_info["id"], chat.id, success
+    )
+    if result == "free":
+        await message.reply_text("T'es déjà libre, chef. /prison pour vérifier.")
+        return
+    if result == "expired":
+        await message.reply_text("Ta peine est finie. Retour dans le quartier!")
+        return
+    if result == "missing":
+        await message.reply_text("Ton profil n'est pas encore créé. Tape /start!")
+        return
+    if result == "escaped":
+        await message.reply_text(
+            "🗝️ Évasion réussie — scénario fictif! T'es libre, "
+            "mais le quartier reste risqué. /profil"
+        )
+        return
+    await message.reply_text(
+        f"🚨 Évasion ratée dans le jeu: +30 secondes de peine "
+        f"({remaining}s restantes) et recherche à {search_level}/100."
+    )
+
+
+async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    actor = await player_context(update, context, ensure_player=False)
     if actor is None:
         return
     actor_info, chat, message = actor
     database = database_for(context)
     args = context.args
+    player = await database.get_player(actor_info["id"], chat.id)
+    if player is None:
+        await message.reply_text("Ton profil n'est pas encore créé. Tape /start!")
+        return
 
     if not args:
-        player = await database.get_player(actor_info["id"], chat.id)
-        if player is None:
-            raise RuntimeError(
-                f"Le joueur {actor_info['id']} est introuvable après son enregistrement."
-            )
         lines = [
             "🚘 Missions d'arcade — tout est fictif\n",
             f"Ton niveau: {player['level']}. Choisis une mission avec "
@@ -830,10 +959,23 @@ async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Gain: {mission.reward}$ | XP: {mission.xp}"
             for mission in MISSIONS
         )
+        lines.extend(
+            f"\n💼 {hustle.name} (/mission_{hustle.mission_id})\n"
+            f"Réussite: {hustle.success_chance:.0%} | "
+            f"Gain: {hustle.reward_min}–{hustle.reward_max}$ | "
+            f"Cooldown: {hustle.cooldown_seconds}s"
+            for hustle in HUSTLES
+        )
         await message.reply_text("\n".join(lines))
         return
 
-    mission = find_mission(" ".join(args))
+    query = " ".join(args)
+    hustle = find_hustle(query)
+    if hustle is not None:
+        await run_hustle(actor_info, chat.id, message, database, hustle)
+        return
+
+    mission = find_mission(query)
     if mission is None:
         await message.reply_text(
             "Mission inconnue. Utilise /missions pour voir les missions et leurs IDs."
@@ -924,6 +1066,121 @@ async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"💸 Amende: -{fine}$ | {penalty}\n"
         f"Solde: {updated_player['cash']}$"
     )
+
+
+async def run_hustle(
+    actor_info: ActorInfo,
+    chat_id: int,
+    message: Message,
+    database: Database,
+    hustle: HustleSpec,
+) -> None:
+    """Resolve a fictional hustle and atomically apply its cooldown and outcome."""
+    player = await database.get_player(actor_info["id"], chat_id)
+    if player is None:
+        await message.reply_text("Ton profil n'est pas encore créé. Tape /start!")
+        return
+    succeeded = random.random() < hustle.success_chance
+    if succeeded:
+        cash_delta = random.randint(hustle.reward_min, hustle.reward_max)
+        search_delta = 0
+        story = (
+            f"✅ Le hustle est passé clean. Tu ramasses <b>{cash_delta}$</b> "
+            "dans les rues de Montréal."
+        )
+    else:
+        cash_delta = -random.randint(10, 50)
+        search_delta = 1
+        story = (
+            "❌ Ça tourne mal: le hustle échoue. "
+            f"💸 Amende de <b>{-cash_delta}$</b>.\n"
+            "🚨 Les policiers te remarquent: indice de recherche <b>+1</b>."
+        )
+
+    status, remaining, balance, search_level, applied_cash_delta = (
+        await database.apply_hustle_result(
+            actor_info["id"],
+            chat_id,
+            hustle.cooldown_seconds,
+            cash_delta,
+            search_delta,
+        )
+    )
+    if status == "missing":
+        await message.reply_text("Ton profil n'est pas encore créé. Tape /start!")
+        return
+    if status == "prison":
+        await message.reply_text(
+            f"🚔 {actor_info['name']}, tu es encore en taule pour {remaining}s."
+        )
+        return
+    if status == "cooldown":
+        await message.reply_text(
+            f"⏳ {actor_info['name']}, le quartier a besoin d'une pause. "
+            f"Réessaie dans {remaining}s."
+        )
+        return
+
+    if not succeeded and applied_cash_delta != cash_delta:
+        story = (
+            "❌ Ça tourne mal: le hustle échoue. "
+            f"💸 Amende de <b>{-applied_cash_delta}$</b>.\n"
+            "🚨 Les policiers te remarquent: indice de recherche <b>+1</b>."
+        )
+    search_increase = max(0, search_level - int(player["search_level"]))
+    await message.reply_text(
+        f"💼 <b>{escape(hustle.name)}</b>\n"
+        f"Salut {escape(actor_info['name'])}, le quartier n'attend pas!\n\n"
+        f"{story}\n\n"
+        f"💰 Solde: {balance}$ | 🔥 Recherche: {search_level}/100"
+        f"{f' (+{search_increase})' if search_increase else ''}\n"
+        f"⏱️ Prochain hustle dans {hustle.cooldown_seconds}s.",
+        parse_mode="HTML",
+    )
+
+
+async def hustle_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    hustle: HustleSpec,
+) -> None:
+    actor = await player_context(update, context, ensure_player=False)
+    if actor is None:
+        return
+    actor_info, chat, message = actor
+    await run_hustle(actor_info, chat.id, message, database_for(context), hustle)
+
+
+async def mission_colis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await hustle_command(update, context, HUSTLES[0])
+
+
+async def mission_phishing(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    await hustle_command(update, context, HUSTLES[1])
+
+
+async def mission_catalyseur(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    await hustle_command(update, context, HUSTLES[2])
+
+
+async def mission_vapote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await hustle_command(update, context, HUSTLES[3])
+
+
+async def mission_depanneur(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    await hustle_command(update, context, HUSTLES[4])
+
+
+async def mission_sneakers(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    await hustle_command(update, context, HUSTLES[5])
 
 
 async def casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1080,6 +1337,24 @@ async def casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_text(f"{result_text}\n💵 Nouveau solde: {new_balance}$.")
 
 
+async def missions_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    await missions(update, context)
+
+
+async def mission_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    await missions(update, context)
+
+
+async def casino_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    await casino(update, context)
+
+
 async def pay_bail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
@@ -1140,9 +1415,16 @@ def main() -> None:
     application.add_handler(CommandHandler("braquer", braquer))
     application.add_handler(CommandHandler("top", top))
     application.add_handler(CommandHandler("prison", prison))
-    application.add_handler(CommandHandler("missions", missions))
-    application.add_handler(CommandHandler("mission", missions))
-    application.add_handler(CommandHandler("casino", casino))
+    application.add_handler(CommandHandler("evade", evade))
+    application.add_handler(CommandHandler("missions", missions_command))
+    application.add_handler(CommandHandler("mission", mission_command))
+    application.add_handler(CommandHandler("mission_colis", mission_colis))
+    application.add_handler(CommandHandler("mission_phishing", mission_phishing))
+    application.add_handler(CommandHandler("mission_catalyseur", mission_catalyseur))
+    application.add_handler(CommandHandler("mission_vapote", mission_vapote))
+    application.add_handler(CommandHandler("mission_depanneur", mission_depanneur))
+    application.add_handler(CommandHandler("mission_sneakers", mission_sneakers))
+    application.add_handler(CommandHandler("casino", casino_command))
     application.add_handler(
         CallbackQueryHandler(
             handle_game_action,
