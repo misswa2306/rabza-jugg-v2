@@ -3,7 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from telegram import Bot, Update, User
 from telegram.error import BadRequest
@@ -23,6 +23,8 @@ from bot import (
     mission_command,
     casino_command,
     profil,
+    give_command,
+    main as bot_main,
     mission_colis,
     mission_phishing,
     mission_catalyseur,
@@ -62,6 +64,7 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
         for command in (
             "/start",
             "/profil",
+            "/give",
             "/casino",
             "/missions",
             "/mission",
@@ -96,6 +99,7 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
             for command in (
                 "start",
                 "profil",
+                "give",
                 "casino",
                 "missions",
                 "mission",
@@ -144,6 +148,116 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
                     )
 
                     self.assertIsNotNone(command_handler.check_update(update))
+
+    def test_main_registers_give_command(self) -> None:
+        application = MagicMock()
+        builder = MagicMock()
+        builder.token.return_value = builder
+        builder.post_init.return_value = builder
+        builder.build.return_value = application
+
+        with (
+            patch("bot.ApplicationBuilder", return_value=builder),
+            patch("bot.validate_config"),
+        ):
+            bot_main()
+
+        handlers = [call.args[0] for call in application.add_handler.call_args_list]
+        self.assertTrue(
+            any(
+                isinstance(handler, CommandHandler) and "give" in handler.commands
+                for handler in handlers
+            )
+        )
+
+
+class GiveCommandTests(unittest.IsolatedAsyncioTestCase):
+    def _context(self, database: AsyncMock, args: list[str]) -> SimpleNamespace:
+        return SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database}),
+            args=args,
+        )
+
+    def _update(self, message: SimpleNamespace) -> SimpleNamespace:
+        return SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=101, username="sender", full_name="Sender Name", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
+            effective_message=message,
+        )
+
+    async def test_give_by_username_transfers_cash_and_confirms_balance(self) -> None:
+        database = AsyncMock()
+        database.get_player_by_username.return_value = {
+            "user_id": 202,
+            "username": "recipient",
+        }
+        database.transfer_cash.return_value = {
+            "status": "ok",
+            "sender_balance": 425,
+            "recipient_balance": 575,
+        }
+        message = SimpleNamespace(
+            reply_to_message=None, reply_text=AsyncMock()
+        )
+
+        await give_command(
+            self._update(message), self._context(database, ["@recipient", "75"])
+        )
+
+        database.transfer_cash.assert_awaited_once_with(101, 202, 75, -1001)
+        message.reply_text.assert_awaited_once_with(
+            "💸 Virement effectué ! Tu as envoyé 75$ à recipient.\n"
+            "💰 Ton nouveau solde: 425$",
+            parse_mode="HTML",
+        )
+
+    async def test_give_by_reply_resolves_recipient_without_username_lookup(self) -> None:
+        database = AsyncMock()
+        database.transfer_cash.return_value = {
+            "status": "ok",
+            "sender_balance": 400,
+            "recipient_balance": 600,
+        }
+        replied_message = SimpleNamespace(
+            from_user=SimpleNamespace(
+                id=202, full_name="Reply Recipient", is_bot=False
+            ),
+            sender_chat=None,
+        )
+        message = SimpleNamespace(
+            reply_to_message=replied_message, reply_text=AsyncMock()
+        )
+
+        await give_command(self._update(message), self._context(database, ["100"]))
+
+        database.get_player_by_username.assert_not_awaited()
+        database.transfer_cash.assert_awaited_once_with(101, 202, 100, -1001)
+        self.assertIn("Reply Recipient", message.reply_text.await_args.args[0])
+
+    async def test_give_rejects_invalid_amount_and_self_transfer(self) -> None:
+        database = AsyncMock()
+        reply = SimpleNamespace(
+            from_user=SimpleNamespace(id=101, full_name="Sender Name", is_bot=False),
+            sender_chat=None,
+        )
+        message = SimpleNamespace(
+            reply_to_message=reply, reply_text=AsyncMock()
+        )
+
+        await give_command(self._update(message), self._context(database, ["0"]))
+        message.reply_text.assert_awaited_once_with(
+            "❌ Le montant doit être supérieur à 0$."
+        )
+        database.transfer_cash.assert_not_awaited()
+
+        message.reply_text.reset_mock()
+        await give_command(self._update(message), self._context(database, ["50"]))
+        message.reply_text.assert_awaited_once_with(
+            "❌ Tu ne peux pas t'envoyer du cash à toi-même."
+        )
+        database.transfer_cash.assert_not_awaited()
 
 
 class EditCallbackMessageTests(unittest.IsolatedAsyncioTestCase):
@@ -268,6 +382,46 @@ class GroupPlayerContextTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(
                 "Profil de Admins de Montréal",
                 message.reply_text.await_args.args[0],
+            )
+
+    async def test_anonymous_admin_uses_sender_chat_when_telegram_sets_bot_user(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            database = Database(str(Path(temp_dir) / "anonymous-proxy.sqlite3"))
+            await database.initialize()
+            context = SimpleNamespace(
+                application=SimpleNamespace(bot_data={"database": database})
+            )
+            sender_chat = SimpleNamespace(id=-100789, title="Admin anonyme")
+            update = SimpleNamespace(
+                effective_user=SimpleNamespace(
+                    id=1087968824,
+                    username="GroupAnonymousBot",
+                    full_name="GroupAnonymousBot",
+                    is_bot=True,
+                ),
+                effective_chat=SimpleNamespace(id=-100789),
+                effective_message=SimpleNamespace(sender_chat=sender_chat),
+            )
+
+            actor = await player_context(update, context)
+
+            self.assertEqual(actor[0]["id"], -100789)
+            self.assertEqual(
+                await database.get_player(-100789, -100789),
+                {
+                    "user_id": -100789,
+                    "username": "Admin anonyme",
+                    "cash": 500,
+                    "balance": 500,
+                    "heat": 0,
+                    "in_prison_until": 0,
+                    "gamos": "Aucun",
+                    "level": 1,
+                    "xp": 0,
+                    "search_level": 0,
+                    "last_hustle_time": 0,
+                    "last_hustle_cooldown": 0,
+                },
             )
 
 

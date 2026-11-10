@@ -49,6 +49,8 @@ Ne publie jamais le token dans le code ou dans un dépôt.
 - `/help` — liste des commandes disponibles
 - `/start` — inscription et accueil
 - `/profil` — cash, gamos, heat et statut
+- `/give <montant>` — envoyer du cash en répondant au message d'un joueur
+- `/give @username <montant>` — envoyer du cash à un joueur inscrit dans le groupe
 - `/jugg` — menu des actions du mini-jeu
 - `/shop` — marketplace d'items de jeu, verrouillés par niveau
 - `/inventory` — inventaire et bonus des items

@@ -1,8 +1,9 @@
 """SQLite persistence for players."""
 
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 import time
-from typing import Any
+from typing import Any, AsyncIterator
 
 import aiosqlite
 
@@ -33,6 +34,19 @@ def _epoch_timestamp(value: object) -> float | None:
 class Database:
     def __init__(self, path: str) -> None:
         self.path = path
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Open an immediate SQLite transaction and roll it back on errors."""
+        async with aiosqlite.connect(self.path) as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield connection
+            except BaseException:
+                await connection.rollback()
+                raise
+            else:
+                await connection.commit()
 
     async def initialize(self) -> None:
         async with aiosqlite.connect(self.path) as connection:
@@ -619,6 +633,75 @@ class Database:
             )
             row = await cursor.fetchone()
             return dict(row) if row is not None else None
+
+    async def transfer_cash(
+        self, sender_id: int, recipient_id: int, amount: int, chat_id: int = 0
+    ) -> dict[str, int | str]:
+        """Transfer cash between two players atomically within one chat."""
+        if amount <= 0:
+            raise ValueError("Le montant du virement doit être positif.")
+        if sender_id == recipient_id:
+            return {"status": "self"}
+
+        async with self.transaction() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT user_id, cash
+                FROM players
+                WHERE chat_id = ? AND user_id IN (?, ?)
+                """,
+                (chat_id, sender_id, recipient_id),
+            )
+            players = {int(row[0]): int(row[1]) for row in await cursor.fetchall()}
+            if sender_id not in players:
+                return {"status": "sender_missing"}
+            if recipient_id not in players:
+                return {"status": "recipient_missing"}
+
+            sender_balance = players[sender_id]
+            if sender_balance < amount:
+                return {
+                    "status": "insufficient",
+                    "sender_balance": sender_balance,
+                }
+
+            cursor = await connection.execute(
+                """
+                UPDATE players
+                SET cash = cash - ?
+                WHERE chat_id = ? AND user_id = ? AND cash >= ?
+                """,
+                (amount, chat_id, sender_id, amount),
+            )
+            if cursor.rowcount != 1:
+                return {
+                    "status": "insufficient",
+                    "sender_balance": sender_balance,
+                }
+            cursor = await connection.execute(
+                """
+                UPDATE players
+                SET cash = cash + ?
+                WHERE chat_id = ? AND user_id = ?
+                """,
+                (amount, chat_id, recipient_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Le destinataire a disparu pendant le virement.")
+
+            cursor = await connection.execute(
+                """
+                SELECT user_id, cash FROM players
+                WHERE chat_id = ? AND user_id IN (?, ?)
+                """,
+                (chat_id, sender_id, recipient_id),
+            )
+            balances = {int(row[0]): int(row[1]) for row in await cursor.fetchall()}
+            return {
+                "status": "ok",
+                "sender_balance": balances[sender_id],
+                "recipient_balance": balances[recipient_id],
+            }
 
     async def apply_pvp_result(
         self,

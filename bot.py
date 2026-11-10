@@ -200,26 +200,24 @@ async def player_context(
     message = update.effective_message
     if chat is None or message is None:
         return None
+    sender_chat = getattr(message, "sender_chat", None)
 
     if actor_override is not None:
         actor_info = actor_override
-    elif user is not None:
-        if user.is_bot:
-            return None
+    elif user is not None and not user.is_bot:
         actor_info: ActorInfo = {
             "id": user.id,
             "name": user.full_name,
             "username": user.username,
         }
-    else:
-        sender_chat = message.sender_chat
-        if sender_chat is None:
-            return None
+    elif sender_chat is not None:
         actor_info = {
             "id": sender_chat.id,
             "name": sender_chat.title or "Admin Anonyme",
             "username": sender_chat.title or "Admin Anonyme",
         }
+    else:
+        return None
 
     if ensure_player:
         await database_for(context).ensure_player(
@@ -387,6 +385,8 @@ async def help_command(
         "/start — démarrer le bot\n"
         "/profil — consulter cash, niveau, XP et statut\n"
         "/top — classement du groupe\n"
+        "/give <montant> — envoyer du cash en répondant à un joueur\n"
+        "/give @username <montant> — envoyer du cash à un joueur\n"
         "/prison — consulter sa peine et payer la caution (avocat)\n"
         "/evade — tenter une évasion fictive si tu es en taule\n\n"
         "🎯 Jeux d'arcade\n"
@@ -844,6 +844,109 @@ async def braquer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"{result.message} Direction Bordeaux pour {PRISON_DURATION_SECONDS} secondes. "
             "Aucun cash n'a changé de mains."
         )
+
+
+async def give_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    actor = await player_context(update, context, ensure_player=False)
+    if actor is None:
+        return
+    actor_info, chat, message = actor
+    database = database_for(context)
+    reply_to = message.reply_to_message
+
+    recipient_id: int
+    recipient_name: str
+    if len(context.args) == 1 and reply_to is not None:
+        amount_text = context.args[0]
+        recipient_user = reply_to.from_user
+        recipient_chat = reply_to.sender_chat
+        if recipient_user is not None and not recipient_user.is_bot:
+            recipient_id = recipient_user.id
+            recipient_name = recipient_user.full_name
+        elif recipient_chat is not None:
+            recipient_id = recipient_chat.id
+            recipient_name = recipient_chat.title or "Admin anonyme"
+        elif recipient_user is not None:
+            await message.reply_text(
+                "❌ Tu peux seulement envoyer du cash à un joueur."
+            )
+            return
+        else:
+            await message.reply_text(
+                "❌ Destinataire introuvable. Réponds au message d'un joueur."
+            )
+            return
+    elif len(context.args) == 2 and context.args[0].startswith("@"):
+        username = context.args[0][1:]
+        amount_text = context.args[1]
+        if not username:
+            await message.reply_text(
+                "Usage: /give <montant> en réponse à un joueur, "
+                "ou /give @username <montant>."
+            )
+            return
+        recipient = await database.get_player_by_username(username, chat.id)
+        if recipient is None:
+            await message.reply_text(
+                "❌ Joueur introuvable. Il doit être inscrit dans ce groupe avec "
+                "un username Telegram."
+            )
+            return
+        recipient_id = int(recipient["user_id"])
+        recipient_name = str(recipient.get("username") or username)
+    else:
+        await message.reply_text(
+            "Usage: /give <montant> en réponse à un joueur, "
+            "ou /give @username <montant>."
+        )
+        return
+
+    if not amount_text.isdecimal():
+        await message.reply_text("❌ Le montant doit être un entier positif.")
+        return
+    try:
+        amount = int(amount_text)
+    except ValueError:
+        await message.reply_text("❌ Le montant indiqué est invalide.")
+        return
+    if amount <= 0:
+        await message.reply_text("❌ Le montant doit être supérieur à 0$.")
+        return
+    if recipient_id == actor_info["id"]:
+        await message.reply_text("❌ Tu ne peux pas t'envoyer du cash à toi-même.")
+        return
+
+    result = await database.transfer_cash(
+        actor_info["id"], recipient_id, amount, chat.id
+    )
+    status = result["status"]
+    if status == "sender_missing":
+        await message.reply_text("❌ Ton profil est introuvable. Tape /start d'abord.")
+        return
+    if status == "recipient_missing":
+        await message.reply_text(
+            "❌ Ce joueur n'est pas inscrit dans ce groupe. "
+            "Il doit d'abord utiliser /start."
+        )
+        return
+    if status == "insufficient":
+        await message.reply_text(
+            f"❌ Pas assez de cash: tu as {result['sender_balance']}$ "
+            f"et tu veux envoyer {amount}$."
+        )
+        return
+    if status != "ok":
+        await message.reply_text("❌ Le virement n'a pas pu être effectué.")
+        return
+
+    await message.reply_text(
+        f"💸 Virement effectué ! Tu as envoyé {amount}$ à "
+        f"{escape(recipient_name)}.\n"
+        f"💰 Ton nouveau solde: {result['sender_balance']}$",
+        parse_mode="HTML",
+    )
 
 
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1409,6 +1512,7 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("profil", profil))
+    application.add_handler(CommandHandler("give", give_command))
     application.add_handler(CommandHandler("jugg", jugg))
     application.add_handler(CommandHandler("shop", shop))
     application.add_handler(CommandHandler("inventory", inventory))

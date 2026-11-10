@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 import tempfile
 import time
@@ -207,6 +208,76 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(counter["fine"], 100)
         self.assertEqual((await self.database.get_player(505))["cash"], 1612)
         self.assertEqual((await self.database.get_player(606))["cash"], 388)
+
+    async def test_cash_transfer_moves_money_atomically(self) -> None:
+        await self.database.ensure_player(1101, "sender", -1001)
+        await self.database.ensure_player(1102, "recipient", -1001)
+
+        result = await self.database.transfer_cash(1101, 1102, 175, -1001)
+
+        self.assertEqual(
+            result,
+            {
+                "status": "ok",
+                "sender_balance": 325,
+                "recipient_balance": 675,
+            },
+        )
+        self.assertEqual(
+            (await self.database.get_player(1101, -1001))["cash"], 325
+        )
+        self.assertEqual(
+            (await self.database.get_player(1102, -1001))["cash"], 675
+        )
+
+    async def test_cash_transfer_rejects_self_missing_and_insufficient_accounts(self) -> None:
+        await self.database.ensure_player(1201, "sender", -1002)
+        await self.database.ensure_player(1202, "recipient", -1002)
+
+        self.assertEqual(
+            await self.database.transfer_cash(1201, 1201, 1, -1002),
+            {"status": "self"},
+        )
+        self.assertEqual(
+            await self.database.transfer_cash(1201, 1299, 1, -1002),
+            {"status": "recipient_missing"},
+        )
+        self.assertEqual(
+            await self.database.transfer_cash(1201, 1202, 501, -1002),
+            {"status": "insufficient", "sender_balance": 500},
+        )
+        self.assertEqual(
+            (await self.database.get_player(1201, -1002))["cash"], 500
+        )
+        self.assertEqual(
+            (await self.database.get_player(1202, -1002))["cash"], 500
+        )
+
+    async def test_cash_transfer_requires_positive_amount(self) -> None:
+        with self.assertRaises(ValueError):
+            await self.database.transfer_cash(1, 2, 0)
+
+    async def test_concurrent_transfers_cannot_overdraw_sender(self) -> None:
+        await self.database.ensure_player(1301, "sender", -1003)
+        await self.database.ensure_player(1302, "first", -1003)
+        await self.database.ensure_player(1303, "second", -1003)
+
+        results = await asyncio.gather(
+            self.database.transfer_cash(1301, 1302, 400, -1003),
+            self.database.transfer_cash(1301, 1303, 400, -1003),
+        )
+
+        self.assertCountEqual(
+            [result["status"] for result in results], ["ok", "insufficient"]
+        )
+        self.assertEqual(
+            (await self.database.get_player(1301, -1003))["cash"], 100
+        )
+        recipient_balances = [
+            (await self.database.get_player(user_id, -1003))["cash"]
+            for user_id in (1302, 1303)
+        ]
+        self.assertCountEqual(recipient_balances, [900, 500])
 
     async def test_pvp_failure_sets_prison_without_transferring_cash(self) -> None:
         await self.database.ensure_player(808, "joueur_a")
