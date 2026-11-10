@@ -93,6 +93,8 @@ class Database:
                             CHECK (search_level BETWEEN 0 AND 100),
                         last_hustle_time REAL NOT NULL DEFAULT 0,
                         last_hustle_cooldown INTEGER NOT NULL DEFAULT 0,
+                        last_jugg_time REAL NOT NULL DEFAULT 0,
+                        last_jugg_cooldown INTEGER NOT NULL DEFAULT 0,
                         PRIMARY KEY (chat_id, user_id)
                     )
                     """
@@ -151,6 +153,8 @@ class Database:
                             CHECK (search_level BETWEEN 0 AND 100),
                         last_hustle_time REAL NOT NULL DEFAULT 0,
                         last_hustle_cooldown INTEGER NOT NULL DEFAULT 0,
+                        last_jugg_time REAL NOT NULL DEFAULT 0,
+                        last_jugg_cooldown INTEGER NOT NULL DEFAULT 0,
                         PRIMARY KEY (chat_id, user_id)
                     )
                     """
@@ -185,6 +189,20 @@ class Database:
                 await connection.execute(
                     """
                     ALTER TABLE players ADD COLUMN last_hustle_cooldown INTEGER
+                    NOT NULL DEFAULT 0
+                    """
+                )
+            if "last_jugg_time" not in player_columns:
+                await connection.execute(
+                    """
+                    ALTER TABLE players ADD COLUMN last_jugg_time REAL
+                    NOT NULL DEFAULT 0
+                    """
+                )
+            if "last_jugg_cooldown" not in player_columns:
+                await connection.execute(
+                    """
+                    ALTER TABLE players ADD COLUMN last_jugg_cooldown INTEGER
                     NOT NULL DEFAULT 0
                     """
                 )
@@ -296,7 +314,8 @@ class Database:
                 SELECT user_id, username, cash, balance, heat,
                        in_prison_until, gamos,
                        level, xp, search_level, last_hustle_time,
-                       last_hustle_cooldown
+                       last_hustle_cooldown, last_jugg_time,
+                       last_jugg_cooldown
                 FROM players WHERE user_id = ? AND chat_id = ?
                 """,
                 (user_id, chat_id),
@@ -543,6 +562,96 @@ class Database:
                 new_search_level,
                 actual_cash_delta,
             )
+
+    async def apply_jugg_result(
+        self,
+        user_id: int,
+        chat_id: int,
+        cooldown_seconds: int,
+        cash_delta: int,
+        heat_delta: int,
+        prison_seconds: int = 0,
+    ) -> dict[str, int | str]:
+        """Atomically apply one fictional jugg result and its dedicated cooldown."""
+        cooldown_seconds = min(30, max(15, int(cooldown_seconds)))
+        prison_seconds = max(0, int(prison_seconds))
+        now = time.time()
+        async with aiosqlite.connect(self.path) as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                """
+                SELECT cash, heat, search_level, in_prison_until,
+                       last_jugg_time, last_jugg_cooldown
+                FROM players
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (user_id, chat_id),
+            )
+            player = await cursor.fetchone()
+            if player is None:
+                await connection.rollback()
+                return {"status": "missing"}
+
+            prison_until = _epoch_timestamp(player["in_prison_until"])
+            if prison_until is not None and prison_until > now:
+                await connection.rollback()
+                return {
+                    "status": "prison",
+                    "remaining": max(1, int(prison_until - now + 0.999)),
+                }
+
+            last_jugg_time = float(player["last_jugg_time"] or 0)
+            previous_cooldown = min(
+                30, int(player["last_jugg_cooldown"] or 0)
+            )
+            remaining = previous_cooldown - (now - last_jugg_time)
+            if last_jugg_time > 0 and remaining > 0:
+                await connection.rollback()
+                return {
+                    "status": "cooldown",
+                    "remaining": max(1, int(remaining + 0.999)),
+                }
+
+            previous_cash = int(player["cash"])
+            new_cash = max(0, previous_cash + cash_delta)
+            actual_cash_delta = new_cash - previous_cash
+            previous_heat = int(player["heat"])
+            new_heat = min(100, max(0, previous_heat + heat_delta))
+            new_search_level = min(
+                100, max(0, int(player["search_level"]) + heat_delta)
+            )
+            new_prison_until = now + prison_seconds if prison_seconds else 0
+            await connection.execute(
+                """
+                UPDATE players
+                SET cash = ?, heat = ?, search_level = ?,
+                    in_prison_until = ?, last_jugg_time = ?,
+                    last_jugg_cooldown = ?
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (
+                    new_cash,
+                    new_heat,
+                    new_search_level,
+                    new_prison_until,
+                    now,
+                    cooldown_seconds,
+                    user_id,
+                    chat_id,
+                ),
+            )
+            await connection.commit()
+            return {
+                "status": "ok",
+                "balance": new_cash,
+                "cash_delta": actual_cash_delta,
+                "heat_delta": new_heat - previous_heat,
+                "heat": new_heat,
+                "search_level": new_search_level,
+                "prison_seconds": prison_seconds,
+                "cooldown_seconds": cooldown_seconds,
+            }
 
     async def get_inventory(
         self, user_id: int, chat_id: int = 0

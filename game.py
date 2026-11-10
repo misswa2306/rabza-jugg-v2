@@ -51,6 +51,43 @@ class HustleSpec:
     success_message: str
 
 
+@dataclass(frozen=True)
+class JuggTierSpec:
+    tier_id: str
+    title: str
+    success_reward: int
+    success_chance: float
+    failure_fine: int
+    cooldown_seconds: int
+    success_heat: int
+
+
+@dataclass(frozen=True)
+class JuggResult:
+    success: bool
+    cash_delta: int
+    heat_delta: int
+    prison_seconds: int
+    message: str
+
+
+JUGG_TIERS = (
+    JuggTierSpec("bloc", "⚡ Petit Hustle de Bloc", 1200, 0.85, 150, 15, 1),
+    JuggTierSpec(
+        "centre_ville", "🔥 Gros Business Centre-Ville", 4500, 0.60, 700, 25, 3
+    ),
+    JuggTierSpec(
+        "international",
+        "👑 Opération Internationale / Masterclass",
+        15000,
+        0.35,
+        2500,
+        30,
+        5,
+    ),
+)
+
+
 HUSTLES = (
     HustleSpec(
         "colis",
@@ -1092,6 +1129,50 @@ def resolve_pvp(
         "Le braquage fictif échoue; les condés interviennent. "
         "Aucun cash n'est transféré.",
         prison_seconds=PRISON_DURATION_SECONDS,
+    )
+
+
+def resolve_jugg(
+    tier_id: str,
+    success_roll: float | None = None,
+    setback_roll: float | None = None,
+) -> JuggResult:
+    """Resolve a fictional arcade business tier without real-world instructions."""
+    spec = next((tier for tier in JUGG_TIERS if tier.tier_id == tier_id), None)
+    if spec is None:
+        raise ValueError(f"Palier de jugg inconnu: {tier_id}")
+    success = random.random() if success_roll is None else success_roll
+    if not 0 <= success < 1:
+        raise ValueError("Le tirage doit être compris entre 0 inclus et 1 exclu")
+    if success < spec.success_chance:
+        return JuggResult(
+            True,
+            spec.success_reward,
+            spec.success_heat,
+            0,
+            f"✅ Le scénario d'arcade est maîtrisé: la manche crédite "
+            f"{spec.success_reward}$ à ta caisse.",
+        )
+
+    setback = random.random() if setback_roll is None else setback_roll
+    if not 0 <= setback < 1:
+        raise ValueError("Le tirage doit être compris entre 0 inclus et 1 exclu")
+    if setback < 0.5:
+        return JuggResult(
+            False,
+            -spec.failure_fine,
+            4,
+            0,
+            f"🚨 Contrôle fictif dans le mini-jeu: amende de "
+            f"{spec.failure_fine}$.",
+        )
+    return JuggResult(
+        False,
+        0,
+        8,
+        20,
+        "🚔 La manche est interrompue dans le scénario: courte pause en "
+        "cellule arcade, 20 secondes.",
     )
 
 

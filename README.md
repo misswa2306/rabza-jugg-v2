@@ -51,7 +51,8 @@ Ne publie jamais le token dans le code ou dans un dépôt.
 - `/profil` — cash, gamos, heat et statut
 - `/give <montant>` — envoyer du cash en répondant au message d'un joueur
 - `/give @username <montant>` — envoyer du cash à un joueur inscrit dans le groupe
-- `/jugg` — menu des actions du mini-jeu
+- `/jugg` ou `/juggling` — menu d'arcade avec trois paliers à récompenses fixes,
+  risques simulés et cooldowns de 15 à 30 secondes
 - `/shop` — boutique Vêtements & Accessoires (tête, vestes, accessoires, pieds),
   véhicules et équipement de jeu
 - `/inventory` — inventaire et bonus des items
@@ -65,6 +66,12 @@ Ne publie jamais le token dans le code ou dans un dépôt.
   d'arcade à récompenses fixes, avec amende de jeu et hausse de l'indice de
   recherche en cas d'échec
 - `/casino` — menu du casino fictif (blackjack et roulette)
+
+Le menu `/jugg` inclut les paliers fictifs Petit Hustle de Bloc (jusqu'à
+1 200$), Gros Business Centre-Ville (4 500$) et Opération Internationale /
+Masterclass (15 000$). Chaque palier a une chance de réussite, une amende ou
+une courte peine simulée en cas d'échec, et son propre cooldown de 15, 25 ou
+30 secondes, persisté par joueur et conversation.
 
 Dans les groupes, les commandes acceptent aussi la mention du bot, par exemple
 `/help@Rabza_Jugg_V2_bot` et `/casino@Rabza_Jugg_V2_bot`.

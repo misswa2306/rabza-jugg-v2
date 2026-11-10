@@ -30,6 +30,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(player["search_level"], 0)
         self.assertEqual(player["last_hustle_time"], 0)
         self.assertEqual(player["last_hustle_cooldown"], 0)
+        self.assertEqual(player["last_jugg_time"], 0)
+        self.assertEqual(player["last_jugg_cooldown"], 0)
         self.assertEqual(player["gamos"], "Aucun")
 
         applied = await self.database.apply_action_result(
@@ -87,6 +89,54 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.database.apply_hustle_result(101, 0, 120, 100, 0)
         player = await self.database.get_player(101)
         self.assertEqual(player["last_hustle_cooldown"], 30)
+
+    async def test_jugg_result_is_atomic_and_uses_a_dedicated_cooldown(self) -> None:
+        await self.database.ensure_player(102, "jugg")
+
+        result = await self.database.apply_jugg_result(102, 0, 15, 1200, 1)
+
+        self.assertEqual(
+            result,
+            {
+                "status": "ok",
+                "balance": 1700,
+                "cash_delta": 1200,
+                "heat_delta": 1,
+                "heat": 1,
+                "search_level": 1,
+                "prison_seconds": 0,
+                "cooldown_seconds": 15,
+            },
+        )
+        player = await self.database.get_player(102)
+        self.assertGreater(player["last_jugg_time"], 0)
+        self.assertEqual(player["last_jugg_cooldown"], 15)
+        self.assertEqual(player["last_hustle_time"], 0)
+
+        blocked = await self.database.apply_jugg_result(102, 0, 30, 15000, 5)
+        self.assertEqual(blocked["status"], "cooldown")
+        self.assertGreater(int(blocked["remaining"]), 0)
+        self.assertLessEqual(int(blocked["remaining"]), 15)
+        self.assertEqual(await self.database.get_player_balance(102), 1700)
+
+    async def test_jugg_fine_is_capped_and_failure_can_set_short_prison(self) -> None:
+        await self.database.ensure_player(103, "jugg_fail")
+        fined = await self.database.apply_jugg_result(103, 0, 15, -700, 4)
+        self.assertEqual(fined["status"], "ok")
+        self.assertEqual(fined["cash_delta"], -500)
+        self.assertEqual(fined["balance"], 0)
+
+        async with aiosqlite.connect(self.database.path) as connection:
+            await connection.execute(
+                "UPDATE players SET last_jugg_time = 0 WHERE user_id = ?",
+                (103,),
+            )
+            await connection.commit()
+        jailed = await self.database.apply_jugg_result(103, 0, 30, 0, 8, 20)
+        self.assertEqual(jailed["status"], "ok")
+        self.assertEqual(jailed["prison_seconds"], 20)
+        player = await self.database.get_player(103)
+        self.assertGreater(player["in_prison_until"], time.time())
 
     async def test_schema_has_context_scoped_player_and_inventory_keys(self) -> None:
         connection = sqlite3.connect(self.database.path)
@@ -692,6 +742,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         player = await migrated.get_player(707, 707)
         self.assertEqual(player["level"], 1)
         self.assertEqual(player["xp"], 0)
+        self.assertEqual(player["last_jugg_time"], 0)
+        self.assertEqual(player["last_jugg_cooldown"], 0)
         self.assertEqual(
             [item["item_id"] for item in await migrated.get_inventory(707, 707)],
             ["tech_fleece"],

@@ -34,6 +34,7 @@ from game import (
     BAIL_COST,
     HUSTLES,
     ITEMS,
+    JUGG_TIERS,
     MAX_LEVEL,
     PRISON_DURATION_SECONDS,
     SHOP_CATEGORIES,
@@ -42,6 +43,7 @@ from game import (
     item_by_id,
     prison_deadline,
     resolve_action,
+    resolve_jugg,
     resolve_pvp,
     xp_to_next_level,
 )
@@ -299,17 +301,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = await player_context(update, context)
     if actor is None:
         return
-    message = actor[2]
+    actor_info, _chat, message = actor
     await message.reply_text(
-        "🎮 Wesh l'équipe, bienvenue sur le Rabza Jugg V2!\n"
-        "Montréal t'attend: gamos, kichta et missions d'arcade — tout est "
-        "fictif et les résultats sont déterminés aléatoirement.\n\n"
-        "📜 Règles: commence avec 500$, gagne de l'XP pour monter de niveau, "
-        "gère ton cash et ton indice de recherche. Les missions ont des "
-        "cooldowns; certains échecs peuvent entraîner une amende ou une peine "
-        "de jeu. /prison propose la caution (option avocat), /evade une "
-        "tentative d'évasion aléatoire.\n\n"
-        "Tape /help pour toutes les commandes ou /profil pour voir tes stats."
+        f"🎮 Bienvenue dans les rues de Montréal, <b>{escape(actor_info['name'])}</b>!\n"
+        "Ici, tu montes ta kichta, tu fais évoluer ta collection de gamos et "
+        "tu grimpes les niveaux. Chaque bail est un mini-jeu fictif.\n\n"
+        "🚨 Garde l'œil ouvert: un mauvais résultat peut te coûter du cash, "
+        "faire monter ton heat ou t'envoyer en taule arcade. Check /prison "
+        "si la chance tourne contre toi.\n\n"
+        "🛍️ Fais ton style avec /shop\n"
+        "⚡ Lance un palier avec /jugg\n"
+        "📖 Toutes les commandes: /help\n"
+        "💸 Tes stats et ta kichta: /profil",
+        parse_mode="HTML",
     )
 
 
@@ -330,15 +334,15 @@ async def help_command(
         "/prison — consulter sa peine et payer la caution (avocat)\n"
         "/evade — tenter une évasion fictive si tu es en taule\n\n"
         "🎯 Jeux d'arcade\n"
-        "/jugg — choisir un défi d'arcade\n"
+        "/jugg ou /juggling — ouvrir le menu des paliers d'arcade\n"
         "/missions — afficher les missions et les niveaux requis\n"
         "/mission <id> — lancer une mission (ex. /mission civic)\n"
-        "/mission_colis — défi de livraison (60s, 115$)\n"
-        "/mission_phishing — défi de sensibilisation numérique (120s, 275$)\n"
-        "/mission_catalyseur — défi mécanique (180s, 475$)\n"
-        "/mission_vapote — défi de kiosque (45s, 65$)\n"
-        "/mission_depanneur — défi chronométré (300s, 900$)\n"
-        "/mission_sneakers — défi de collection (150s, 400$)\n"
+        "/mission_colis — défi de livraison (cooldown 20s, 115$)\n"
+        "/mission_phishing — défi de sensibilisation numérique (cooldown 25s, 275$)\n"
+        "/mission_catalyseur — défi mécanique (cooldown 30s, 475$)\n"
+        "/mission_vapote — défi de kiosque (cooldown 15s, 65$)\n"
+        "/mission_depanneur — défi chronométré (cooldown 30s, 900$)\n"
+        "/mission_sneakers — défi de collection (cooldown 25s, 400$)\n"
         "/casino — afficher les règles et les jeux\n"
         "/casino blackjack <mise> — jouer au blackjack\n"
         "/casino roulette <choix> <mise> — jouer à la roulette\n\n"
@@ -415,6 +419,15 @@ async def jugg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keyboard = [
         [
             InlineKeyboardButton(
+                f"{tier.title} — jusqu'à {tier.success_reward}$ "
+                f"(risque {1 - tier.success_chance:.0%}, cooldown {tier.cooldown_seconds}s)",
+                callback_data=f"jugg:{actor_info['id']}:{tier.tier_id}",
+            )
+        ]
+        for tier in JUGG_TIERS
+    ] + [
+        [
+            InlineKeyboardButton(
                 spec.title,
                 callback_data=f"game:{actor_info['id']}:{action_id}",
             )
@@ -436,9 +449,78 @@ async def jugg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ]
         )
     await message.reply_text(
-        f"Choisis ton défi d'arcade, chef — niveau {player['level']}. "
-        "Les moves sont fictifs et abstraits:",
+        f"Choisis ton défi d'arcade, chef — niveau {player['level']}.\n"
+        "Paliers Business: mini-jeux fictifs, récompenses fixes et risques "
+        "simulés. Les anciens défis d'arcade restent disponibles:",
         reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def handle_jugg_tier(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    callback_actor = callback_actor_info(update, query.data, "jugg")
+    if callback_actor is None:
+        return
+    actor_info, tier_id = callback_actor
+    actor = await player_context(update, context, actor_info)
+    if actor is None:
+        return
+    actor_info, chat = actor[0], actor[1]
+    tier = next((item for item in JUGG_TIERS if item.tier_id == tier_id), None)
+    if tier is None:
+        await edit_callback_message(query, "Ce palier de jugg n'existe pas.")
+        return
+
+    outcome = resolve_jugg(tier_id)
+    applied = await database_for(context).apply_jugg_result(
+        actor_info["id"],
+        chat.id,
+        tier.cooldown_seconds,
+        outcome.cash_delta,
+        outcome.heat_delta,
+        outcome.prison_seconds,
+    )
+    status = applied["status"]
+    if status == "missing":
+        await edit_callback_message(query, "Profil introuvable. Tape /start.")
+        return
+    if status == "prison":
+        await edit_callback_message(
+            query,
+            f"🚔 {actor_info['name']}, il te reste "
+            f"{applied['remaining']} seconde(s) de pause arcade.",
+        )
+        return
+    if status == "cooldown":
+        remaining = int(applied["remaining"])
+        unit = "seconde" if remaining == 1 else "secondes"
+        await edit_callback_message(
+            query,
+            f"⏳ {actor_info['name']}, ton prochain bail arcade est "
+            f"disponible dans {remaining} {unit}.",
+        )
+        return
+
+    cash_delta = int(applied["cash_delta"])
+    heat_delta = int(applied["heat_delta"])
+    formatted_result = outcome.message
+    if not outcome.success and outcome.prison_seconds == 0:
+        formatted_result = formatted_result.replace(
+            f"{tier.failure_fine}$", f"{-cash_delta}$"
+        )
+    await edit_callback_message(
+        query,
+        f"🎮 {tier.title}\n"
+        f"{formatted_result}\n"
+        f"💵 Cash: {cash_delta:+d}$ | Solde: {applied['balance']}$\n"
+        f"🔥 Heat: {heat_delta:+d} ({applied['heat']}/100) | "
+        f"Recherche: {applied['search_level']}/100\n"
+        f"⏱️ Prochain palier dans {applied['cooldown_seconds']}s.",
     )
 
 
@@ -1478,6 +1560,7 @@ def main() -> None:
     application.add_handler(CommandHandler("profil", profil))
     application.add_handler(CommandHandler("give", give_command))
     application.add_handler(CommandHandler("jugg", jugg))
+    application.add_handler(CommandHandler("juggling", jugg))
     application.add_handler(CommandHandler("shop", shop))
     application.add_handler(CommandHandler("inventory", inventory))
     application.add_handler(CommandHandler("braquer", braquer))
@@ -1493,6 +1576,12 @@ def main() -> None:
     application.add_handler(CommandHandler("mission_depanneur", mission_depanneur))
     application.add_handler(CommandHandler("mission_sneakers", mission_sneakers))
     application.add_handler(CommandHandler("casino", casino_command))
+    application.add_handler(
+        CallbackQueryHandler(
+            handle_jugg_tier,
+            pattern=r"^jugg:",
+        )
+    )
     application.add_handler(
         CallbackQueryHandler(
             handle_game_action,

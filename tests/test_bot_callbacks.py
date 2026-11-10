@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from telegram import Bot, Update, User
 from telegram.error import BadRequest
-from telegram.ext import CommandHandler
+from telegram.ext import CallbackQueryHandler, CommandHandler
 
 from bot import (
     HUSTLES,
@@ -24,7 +24,9 @@ from bot import (
     casino_command,
     profil,
     give_command,
+    handle_jugg_tier,
     main as bot_main,
+    jugg,
     mission_colis,
     mission_phishing,
     mission_catalyseur,
@@ -33,12 +35,49 @@ from bot import (
     mission_sneakers,
     prison_remaining_seconds,
     shop_callback,
+    start,
 )
 from config import validate_config
 from database import Database
 
 
 class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_start_uses_montreal_welcome_and_escapes_player_name(self) -> None:
+        database = AsyncMock()
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database})
+        )
+        message = SimpleNamespace(
+            reply_text=AsyncMock(),
+            sender_chat=None,
+        )
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=101,
+                username="joueur",
+                full_name="Joueur <Chef>",
+                is_bot=False,
+            ),
+            effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
+            effective_message=message,
+        )
+
+        await start(update, context)
+
+        database.ensure_player.assert_awaited_once_with(101, "joueur", -1001)
+        text = message.reply_text.await_args.args[0]
+        self.assertIn("Montréal", text)
+        self.assertIn("Joueur &lt;Chef&gt;", text)
+        self.assertIn("kichta", text)
+        self.assertIn("gamos", text)
+        self.assertIn("taule arcade", text)
+        for command in ("/shop", "/jugg", "/help"):
+            self.assertIn(command, text)
+        self.assertEqual(
+            message.reply_text.await_args.kwargs["parse_mode"],
+            "HTML",
+        )
+
     async def test_command_aliases_await_the_existing_handlers(self) -> None:
         update = SimpleNamespace()
         context = SimpleNamespace()
@@ -77,6 +116,7 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
             "/mission_sneakers",
             "/help",
             "/jugg",
+            "/juggling",
             "/braquer",
             "/shop",
             "/prison",
@@ -112,6 +152,7 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
                 "mission_sneakers",
                 "help",
                 "jugg",
+                "juggling",
                 "braquer",
                 "shop",
                 "prison",
@@ -167,6 +208,19 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any(
                 isinstance(handler, CommandHandler) and "give" in handler.commands
+                for handler in handlers
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(handler, CommandHandler) and "juggling" in handler.commands
+                for handler in handlers
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(handler, CallbackQueryHandler)
+                and handler.pattern.pattern == r"^jugg:"
                 for handler in handlers
             )
         )
@@ -605,6 +659,8 @@ class GroupPlayerContextTests(unittest.IsolatedAsyncioTestCase):
                     "search_level": 0,
                     "last_hustle_time": 0,
                     "last_hustle_cooldown": 0,
+                    "last_jugg_time": 0.0,
+                    "last_jugg_cooldown": 0,
                 },
             )
 
@@ -1076,6 +1132,115 @@ class BraquerChatTypeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class JuggCallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_jugg_menu_contains_three_payout_tiers_and_legacy_actions(self) -> None:
+        database = AsyncMock()
+        database.get_player.return_value = {"level": 1, "in_prison_until": 0}
+        database.get_item_effects.return_value = {"has_obd": False}
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database})
+        )
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=101, username="joueur", full_name="Joueur", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
+            effective_message=message,
+        )
+
+        await jugg(update, context)
+
+        text = message.reply_text.await_args.args[0]
+        self.assertIn("mini-jeux fictifs", text)
+        markup = message.reply_text.await_args.kwargs["reply_markup"]
+        buttons = [
+            button
+            for row in markup.inline_keyboard
+            for button in row
+        ]
+        callbacks = [button.callback_data for button in buttons]
+        labels = [button.text for button in buttons]
+        self.assertIn("jugg:101:bloc", callbacks)
+        self.assertIn("jugg:101:centre_ville", callbacks)
+        self.assertIn("jugg:101:international", callbacks)
+        self.assertTrue(any("1200$" in label for label in labels))
+        self.assertTrue(any("4500$" in label for label in labels))
+        self.assertTrue(any("15000$" in label for label in labels))
+        self.assertIn("game:101:berri", callbacks)
+
+    async def test_jugg_callback_applies_payout_and_reports_new_balance(self) -> None:
+        from game import JuggResult
+
+        database = AsyncMock()
+        database.apply_jugg_result.return_value = {
+            "status": "ok",
+            "balance": 1700,
+            "cash_delta": 1200,
+            "heat_delta": 1,
+            "heat": 1,
+            "search_level": 1,
+            "prison_seconds": 0,
+            "cooldown_seconds": 15,
+        }
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database})
+        )
+        query = AsyncMock(data="jugg:101:bloc")
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(
+                id=101, username="joueur", full_name="Joueur", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
+            effective_message=SimpleNamespace(sender_chat=None),
+        )
+
+        with patch(
+            "bot.resolve_jugg",
+            return_value=JuggResult(True, 1200, 1, 0, "Succès fictif."),
+        ):
+            await handle_jugg_tier(update, context)
+
+        database.apply_jugg_result.assert_awaited_once_with(
+            101, -1001, 15, 1200, 1, 0
+        )
+        text = query.edit_message_text.await_args.args[0]
+        self.assertIn("Cash: +1200$ | Solde: 1700$", text)
+        self.assertIn("Prochain palier dans 15s", text)
+
+    async def test_jugg_callback_shows_precise_remaining_cooldown(self) -> None:
+        from game import JuggResult
+
+        database = AsyncMock()
+        database.apply_jugg_result.return_value = {
+            "status": "cooldown",
+            "remaining": 12,
+        }
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database})
+        )
+        query = AsyncMock(data="jugg:101:bloc")
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(
+                id=101, username="joueur", full_name="Joueur", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
+            effective_message=SimpleNamespace(sender_chat=None),
+        )
+
+        with patch(
+            "bot.resolve_jugg",
+            return_value=JuggResult(True, 1200, 1, 0, "Succès fictif."),
+        ):
+            await handle_jugg_tier(update, context)
+
+        self.assertIn(
+            "disponible dans 12 secondes",
+            query.edit_message_text.await_args.args[0],
+        )
+        self.assertEqual(database.apply_jugg_result.await_count, 1)
+
     async def test_anonymous_owner_callback_uses_group_id(self) -> None:
         database = AsyncMock()
         database.get_player.return_value = {

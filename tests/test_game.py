@@ -4,13 +4,40 @@ from unittest.mock import patch
 
 from game import (
     BASE_SUCCESS_RATE,
+    JUGG_TIERS,
     PRISON_DURATION_SECONDS,
     prison_deadline,
     resolve_action,
+    resolve_jugg,
 )
 
 
 class ResolveActionTests(unittest.TestCase):
+    def test_jugg_tiers_have_fixed_rewards_and_bounded_cooldowns(self) -> None:
+        self.assertEqual(
+            [
+                (tier.tier_id, tier.success_reward, tier.cooldown_seconds)
+                for tier in JUGG_TIERS
+            ],
+            [("bloc", 1200, 15), ("centre_ville", 4500, 25), ("international", 15000, 30)],
+        )
+
+    def test_jugg_success_and_failure_resolve_to_game_only_outcomes(self) -> None:
+        success = resolve_jugg("bloc", success_roll=0.1)
+        fine = resolve_jugg("centre_ville", success_roll=0.9, setback_roll=0.1)
+        prison = resolve_jugg("international", success_roll=0.9, setback_roll=0.9)
+
+        self.assertTrue(success.success)
+        self.assertEqual(success.cash_delta, 1200)
+        self.assertEqual(success.prison_seconds, 0)
+        self.assertIn("arcade", success.message)
+        self.assertEqual(fine.cash_delta, -700)
+        self.assertEqual(fine.prison_seconds, 0)
+        self.assertEqual(prison.cash_delta, 0)
+        self.assertEqual(prison.prison_seconds, 20)
+        with self.assertRaises(ValueError):
+            resolve_jugg("unknown", success_roll=0.1)
+
     def test_vehicle_success_awards_cash_heat_and_car(self) -> None:
         result = resolve_action("steal_rav4", roll=0.49)
         self.assertEqual(result.cash_delta, 350)
