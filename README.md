@@ -60,9 +60,9 @@ Ne publie jamais le token dans le code ou dans un dépôt.
 - `/evade` — tentative d'évasion fictive; un échec prolonge la peine
 - `/missions` ou `/mission` — catalogue de missions fictives et récompenses
 - `/mission_colis`, `/mission_phishing`, `/mission_catalyseur`,
-  `/mission_vapote`, `/mission_depanneur` et `/mission_sneakers` — hustles
-  fictifs avec gains aléatoires, amende possible au sens du jeu et hausse de
-  l'indice de recherche en cas d'échec
+  `/mission_vapote`, `/mission_depanneur` et `/mission_sneakers` — défis
+  d'arcade à récompenses fixes, avec amende de jeu et hausse de l'indice de
+  recherche en cas d'échec
 - `/casino` — menu du casino fictif (blackjack et roulette)
 
 Dans les groupes, les commandes acceptent aussi la mention du bot, par exemple
@@ -71,15 +71,16 @@ Dans les groupes, les commandes acceptent aussi la mention du bot, par exemple
 Les missions se lancent avec un identifiant, par exemple `/mission civic`.
 Elles sont débloquées par niveau, accordent du cash et de l'XP en cas de
 réussite, et peuvent entraîner une amende ou une peine de jeu en cas d'échec.
-Le menu `/missions` affiche aussi les hustles disponibles. Chaque hustle a
-son taux de réussite, sa plage de gains et son cooldown. Le cooldown global
-persistant est enregistré avec le profil du joueur dans chaque conversation.
+Le menu `/missions` affiche aussi les défis disponibles. Chaque défi a
+son taux de réussite, une récompense fixe, une pénalité fixe en cas d'échec et
+son cooldown. Les réussites n'accordent pas d'XP. Le cooldown global persistant
+est enregistré avec le profil du joueur dans chaque conversation.
 Les profils existants sont migrés pour conserver le cash, le niveau et le XP,
 et ajouter l'indice de recherche ainsi que l'horodatage du dernier hustle.
-Les gains et probabilités sont: colis (85%, 80–150$, 60 s), phishing fictif
-(70%, 150–400$, 120 s), catalyseur (60%, 300–650$, 180 s), vapote (90%,
-40–90$, 45 s), dépanneur (50%, 600–1200$, 300 s) et sneakers (75%,
-250–550$, 150 s).
+Les valeurs sont: colis (85%, +115$/−25$, 60 s), phishing (70%,
++275$/−30$, 120 s), catalyseur (60%, +475$/−35$, 180 s), vapote
+(90%, +65$/−20$, 45 s), dépanneur (50%, +900$/−50$, 300 s) et sneakers
+(75%, +400$/−25$, 150 s). Les montants ne sont pas tirés au sort.
 
 Exemples: `/casino blackjack 500`, `/casino roulette rouge 100` ou
 `/casino roulette 17 20`. Une mise doit être un entier positif et ne peut pas

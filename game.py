@@ -41,6 +41,82 @@ class ActionSpec:
 
 
 @dataclass(frozen=True)
+class HustleSpec:
+    mission_id: str
+    name: str
+    success_chance: float
+    success_reward: int
+    failure_penalty: int
+    cooldown_seconds: int
+    success_message: str
+
+
+HUSTLES = (
+    HustleSpec(
+        "colis",
+        "Défi de livraison express (Plateau → St-Léonard)",
+        0.85,
+        115,
+        25,
+        60,
+        "📦 Livraison arcade terminée: tu as validé les étapes du parcours "
+        "Plateau–St-Léonard. Le jeu crédite {cash}$ pour ce score.",
+    ),
+    HustleSpec(
+        "phishing",
+        "Défi de sensibilisation SMS à Saint-Michel",
+        0.70,
+        275,
+        30,
+        120,
+        "📲 Simulation SMS Interac réussie: tu as repéré les signaux d'alerte "
+        "dans le scénario d'entraînement. Les points de la manche valent "
+        "{cash}$ dans le jeu.",
+    ),
+    HustleSpec(
+        "catalyseur",
+        "Défi mécanique de Civic",
+        0.60,
+        475,
+        35,
+        180,
+        "🔧 Épreuve mécanique arcade terminée: tu as complété les contrôles "
+        "virtuels de la Civic dans le temps imparti. Récompense fixe: {cash}$.",
+    ),
+    HustleSpec(
+        "vapote",
+        "Défi de kiosque au Cégep",
+        0.90,
+        65,
+        20,
+        45,
+        "🧃 Défi de kiosque terminé au Cégep: tu as atteint l'objectif de "
+        "service du mini-jeu. Le score ajoute {cash}$ à ta caisse d'arcade.",
+    ),
+    HustleSpec(
+        "depanneur",
+        "Défi chronométré au dépanneur",
+        0.50,
+        900,
+        50,
+        300,
+        "🏪 Parcours chronométré du dépanneur complété dans le mini-jeu: "
+        "tous les checkpoints sont validés. Récompense fixe: {cash}$.",
+    ),
+    HustleSpec(
+        "sneakers",
+        "Défi d'échange de baskets",
+        0.75,
+        400,
+        25,
+        150,
+        "👟 Défi de collection terminé: tu as complété la tournée de baskets "
+        "dans le marché virtuel. Le score de la partie rapporte {cash}$.",
+    ),
+)
+
+
+@dataclass(frozen=True)
 class ShopItem:
     item_id: str
     name: str

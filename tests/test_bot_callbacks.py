@@ -711,7 +711,7 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/mission_phishing", text)
         self.assertIn("Cooldown: 60s", text)
 
-    async def test_hustle_pays_random_reward_and_enforces_global_cooldown(self) -> None:
+    async def test_hustle_pays_fixed_reward_and_enforces_global_cooldown(self) -> None:
         temp_dir, database, context, update, message, chat = await self._setup_hustle(
             ["colis"]
         )
@@ -719,17 +719,17 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("bot.random.random", return_value=0.0),
-            patch("bot.random.randint", return_value=100),
+            patch("bot.random.randint", side_effect=AssertionError("cash must be fixed")),
         ):
             await missions(update, context)
-            self.assertEqual(await database.get_player_balance(888, chat.id), 600)
+            self.assertEqual(await database.get_player_balance(888, chat.id), 615)
 
             message.reply_text.reset_mock()
             context.args = ["vapote"]
             await missions(update, context)
 
         self.assertIn("Réessaie dans", message.reply_text.await_args.args[0])
-        self.assertEqual(await database.get_player_balance(888, chat.id), 600)
+        self.assertEqual(await database.get_player_balance(888, chat.id), 615)
 
     async def test_failed_hustle_can_lose_cash_and_increase_heat(self) -> None:
         temp_dir, database, context, update, message, chat = await self._setup_hustle(
@@ -739,15 +739,15 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("bot.random.random", side_effect=[0.99, 0.0, 0.0]),
-            patch("bot.random.randint", side_effect=[30, 7]),
+            patch("bot.random.randint", side_effect=AssertionError("cash must be fixed")),
         ):
             await missions(update, context)
 
         player = await database.get_player(888, chat.id)
-        self.assertEqual(player["cash"], 470)
+        self.assertEqual(player["cash"], 450)
         self.assertEqual(player["heat"], 1)
         text, = message.reply_text.await_args.args
-        self.assertIn("Cash: -30$ | ✨ XP: +0", text)
+        self.assertIn("Cash: -50$ | ✨ XP: +0", text)
         self.assertIn("Heat: +1 (1/100)", text)
         self.assertIn("Recherche: +1 (1/100)", text)
         self.assertEqual(player["search_level"], 1)
@@ -760,23 +760,22 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
             ["phishing"]
         )
         self.addCleanup(temp_dir.cleanup)
-        scenario = HUSTLES[1].success_scenarios[0]
+        scenario = HUSTLES[1].success_message.format(
+            cash=HUSTLES[1].success_reward
+        )
 
         with (
             patch("bot.random.random", return_value=0.0),
-            patch("bot.random.randint", return_value=310),
-            patch("bot.random.choice", return_value=scenario) as choose_scenario,
+            patch("bot.random.randint", side_effect=AssertionError("cash must be fixed")),
         ):
             await missions(update, context)
 
-        choose_scenario.assert_called_once_with(HUSTLES[1].success_scenarios)
         text = message.reply_text.await_args.args[0]
-        self.assertIn("Défi SMS d'arcade réussi", text)
-        self.assertIn("Cash: +310$ | ✨ XP: +0", text)
+        self.assertIn(scenario, text)
+        self.assertIn("Cash: +275$ | ✨ XP: +0", text)
         self.assertIn("Heat: +0 (0/100)", text)
         self.assertIn("Recherche: +0 (0/100)", text)
         self.assertIn("Prochain hustle dans 120s", text)
-        self.assertNotIn("(mission fictive)", text.casefold())
 
     async def test_hustle_requires_existing_profile_and_supports_anonymous_admin(
         self,
@@ -792,12 +791,12 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
         context.args = []
         with (
             patch("bot.random.random", return_value=0.0),
-            patch("bot.random.randint", return_value=100),
+            patch("bot.random.randint", side_effect=AssertionError("cash must be fixed")),
         ):
             await mission_colis(update, context)
 
         player = await database.get_player(chat.id, chat.id)
-        self.assertEqual(player["cash"], 600)
+        self.assertEqual(player["cash"], 615)
         self.assertIn("Défi de livraison express", message.reply_text.await_args.args[0])
 
     async def test_hustle_handlers_require_start_for_unregistered_player(self) -> None:
@@ -815,30 +814,27 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         from bot import HUSTLES
 
-        self.assertTrue(all(hustle.success_scenarios for hustle in HUSTLES))
-        self.assertTrue(
-            all("(mission fictive)" not in hustle.name.casefold() for hustle in HUSTLES)
-        )
         self.assertEqual(
             [
                 (
                     hustle.mission_id,
                     hustle.success_chance,
-                    hustle.reward_min,
-                    hustle.reward_max,
+                    hustle.success_reward,
+                    hustle.failure_penalty,
                     hustle.cooldown_seconds,
                 )
                 for hustle in HUSTLES
             ],
             [
-                ("colis", 0.85, 80, 150, 60),
-                ("phishing", 0.70, 150, 400, 120),
-                ("catalyseur", 0.60, 300, 650, 180),
-                ("vapote", 0.90, 40, 90, 45),
-                ("depanneur", 0.50, 600, 1200, 300),
-                ("sneakers", 0.75, 250, 550, 150),
+                ("colis", 0.85, 115, 25, 60),
+                ("phishing", 0.70, 275, 30, 120),
+                ("catalyseur", 0.60, 475, 35, 180),
+                ("vapote", 0.90, 65, 20, 45),
+                ("depanneur", 0.50, 900, 50, 300),
+                ("sneakers", 0.75, 400, 25, 150),
             ],
         )
+        self.assertTrue(all(hustle.success_message for hustle in HUSTLES))
 
 
 class BlackjackHandTests(unittest.TestCase):
