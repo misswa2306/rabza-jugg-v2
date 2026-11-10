@@ -747,9 +747,36 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(player["cash"], 470)
         self.assertEqual(player["heat"], 1)
         text, = message.reply_text.await_args.args
-        self.assertIn("indice de recherche <b>+1</b>", text)
+        self.assertIn("Cash: -30$ | ✨ XP: +0", text)
+        self.assertIn("Heat: +1 (1/100)", text)
+        self.assertIn("Recherche: +1 (1/100)", text)
         self.assertEqual(player["search_level"], 1)
         self.assertEqual(message.reply_text.await_args.kwargs["parse_mode"], "HTML")
+
+    async def test_successful_hustle_uses_scenario_and_reports_all_game_deltas(
+        self,
+    ) -> None:
+        temp_dir, _, context, update, message, _ = await self._setup_hustle(
+            ["phishing"]
+        )
+        self.addCleanup(temp_dir.cleanup)
+        scenario = HUSTLES[1].success_scenarios[0]
+
+        with (
+            patch("bot.random.random", return_value=0.0),
+            patch("bot.random.randint", return_value=310),
+            patch("bot.random.choice", return_value=scenario) as choose_scenario,
+        ):
+            await missions(update, context)
+
+        choose_scenario.assert_called_once_with(HUSTLES[1].success_scenarios)
+        text = message.reply_text.await_args.args[0]
+        self.assertIn("Défi SMS d'arcade réussi", text)
+        self.assertIn("Cash: +310$ | ✨ XP: +0", text)
+        self.assertIn("Heat: +0 (0/100)", text)
+        self.assertIn("Recherche: +0 (0/100)", text)
+        self.assertIn("Prochain hustle dans 120s", text)
+        self.assertNotIn("(mission fictive)", text.casefold())
 
     async def test_hustle_requires_existing_profile_and_supports_anonymous_admin(
         self,
@@ -771,7 +798,7 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
 
         player = await database.get_player(chat.id, chat.id)
         self.assertEqual(player["cash"], 600)
-        self.assertIn("Livraison de colis", message.reply_text.await_args.args[0])
+        self.assertIn("Défi de livraison express", message.reply_text.await_args.args[0])
 
     async def test_hustle_handlers_require_start_for_unregistered_player(self) -> None:
         temp_dir, _, context, update, message, _ = await self._setup_hustle(
@@ -788,6 +815,10 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         from bot import HUSTLES
 
+        self.assertTrue(all(hustle.success_scenarios for hustle in HUSTLES))
+        self.assertTrue(
+            all("(mission fictive)" not in hustle.name.casefold() for hustle in HUSTLES)
+        )
         self.assertEqual(
             [
                 (

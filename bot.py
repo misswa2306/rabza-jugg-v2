@@ -75,6 +75,7 @@ class HustleSpec:
     reward_min: int
     reward_max: int
     cooldown_seconds: int
+    success_scenarios: tuple[str, ...]
 
 
 MISSIONS = (
@@ -116,51 +117,100 @@ MISSIONS = (
 HUSTLES = (
     HustleSpec(
         "colis",
-        "Livraison de colis louches (Plateau → St-Léonard)",
+        "Défi de livraison express (Plateau → St-Léonard)",
         0.85,
         80,
         150,
         60,
+        (
+            "📦 Livraison express validée! Ta course du Plateau à St-Léonard "
+            "est bouclée avant la fin du chrono; le tableau crédite {cash}$.",
+            "🚲 Tu termines le parcours Plateau–St-Léonard sans rater un checkpoint "
+            "du mini-jeu. Récompense de la run: {cash}$.",
+            "🗺️ Tous les points de passage sont cochés dans le défi de livraison. "
+            "Le score converti te rapporte {cash}$.",
+        ),
     ),
     HustleSpec(
         "phishing",
-        "Faux support technique / SMS bancaires (mission fictive)",
+        "Défi SMS d'arcade à Saint-Michel",
         0.70,
         150,
         400,
         120,
+        (
+            "📲 Défi SMS d'arcade réussi! Tu as repéré le piège du scénario "
+            "simulé avant toute interaction réelle; le score du mini-jeu te "
+            "rapporte {cash}$.",
+            "🕹️ Manche numérique validée: le faux scénario du mini-jeu est "
+            "déjoué et ton résultat d'arcade vaut {cash}$.",
+            "📱 Tu complètes le défi de sensibilisation numérique de Saint-Michel. "
+            "Le jeu crédite {cash}$ pour cette manche.",
+        ),
     ),
     HustleSpec(
         "catalyseur",
-        "Vol de pot catalytique sur une Civic (jeu fictif)",
+        "Défi mécanique de Civic",
         0.60,
         300,
         650,
         180,
+        (
+            "🔧 Défi mécanique réussi! Tu termines l'épreuve chronométrée sur le "
+            "simulateur de Civic; récompense: {cash}$.",
+            "🏁 La Civic passe tous les checkpoints du mini-jeu mécanique. "
+            "Ton score de la manche vaut {cash}$.",
+            "🛠️ Épreuve de mécanique d'arcade complétée sans faute: {cash}$ "
+            "ajoutés à ton score.",
+        ),
     ),
     HustleSpec(
         "vapote",
-        "Revente de puffs au Cégep (mission fictive)",
+        "Défi de vente au Cégep",
         0.90,
         40,
         90,
         45,
+        (
+            "🧃 Ton kiosque pop-up du mini-jeu fait salle comble au Cégep. "
+            "La manche te rapporte {cash}$.",
+            "🎒 Défi de campus bouclé: tu atteins l'objectif de la partie et "
+            "le jeu crédite {cash}$.",
+            "⚡ Service express au Cégep: tous les objectifs d'arcade sont cochés, "
+            "bonus de manche de {cash}$.",
+        ),
     ),
     HustleSpec(
         "depanneur",
-        "Braquage d'un dépanneur de quartier (jeu fictif)",
+        "Défi chronométré au dépanneur",
         0.50,
         600,
         1200,
         300,
+        (
+            "🏪 Défi du dépanneur validé en mode arcade: tu termines la manche "
+            "chronométrée et le jeu crédite {cash}$.",
+            "🎮 Le scénario de quartier est bouclé sans rater un objectif. "
+            "Récompense du mini-jeu: {cash}$.",
+            "✅ Tous les checkpoints du défi au dépanneur sont réussis. "
+            "Ton score de la partie vaut {cash}$.",
+        ),
     ),
     HustleSpec(
         "sneakers",
-        "Mule de fausses Jordans (mission fictive)",
+        "Défi d'échange de baskets",
         0.75,
         250,
         550,
         150,
+        (
+            "👟 Défi baskets terminé: tu complètes l'échange dans le marché "
+            "d'arcade et empoches {cash}$.",
+            "📦 La tournée de sneakers du mini-jeu atteint tous ses objectifs. "
+            "Récompense de la manche: {cash}$.",
+            "✨ Collection et score validés au marché fictif: le jeu ajoute "
+            "{cash}$ à ta kichta.",
+        ),
     ),
 )
 
@@ -1187,20 +1237,11 @@ async def run_hustle(
     if succeeded:
         cash_delta = random.randint(hustle.reward_min, hustle.reward_max)
         search_delta = 0
-        story = (
-            f"✅ Le hustle est passé clean. Tu ramasses <b>{cash_delta}$</b> "
-            "dans les rues de Montréal."
-        )
     else:
         cash_delta = -random.randint(10, 50)
         search_delta = 1
-        story = (
-            "❌ Ça tourne mal: le hustle échoue. "
-            f"💸 Amende de <b>{-cash_delta}$</b>.\n"
-            "🚨 Les policiers te remarquent: indice de recherche <b>+1</b>."
-        )
 
-    status, remaining, balance, search_level, applied_cash_delta = (
+    status, remaining, balance, _search_level, applied_cash_delta = (
         await database.apply_hustle_result(
             actor_info["id"],
             chat_id,
@@ -1224,19 +1265,33 @@ async def run_hustle(
         )
         return
 
-    if not succeeded and applied_cash_delta != cash_delta:
-        story = (
-            "❌ Ça tourne mal: le hustle échoue. "
-            f"💸 Amende de <b>{-applied_cash_delta}$</b>.\n"
-            "🚨 Les policiers te remarquent: indice de recherche <b>+1</b>."
+    updated_player = await database.get_player(actor_info["id"], chat_id)
+    if updated_player is None:
+        raise RuntimeError(
+            f"Le joueur {actor_info['id']} est introuvable après le hustle."
         )
-    search_increase = max(0, search_level - int(player["search_level"]))
+    heat_delta = int(updated_player["heat"]) - int(player["heat"])
+    search_delta = int(updated_player["search_level"]) - int(
+        player["search_level"]
+    )
+    if succeeded:
+        story = random.choice(hustle.success_scenarios).format(
+            cash=applied_cash_delta
+        )
+    else:
+        story = (
+            "❌ Le défi échoue: l'arcade applique une pénalité de "
+            f"<b>{-applied_cash_delta}$</b>."
+        )
     await message.reply_text(
         f"💼 <b>{escape(hustle.name)}</b>\n"
         f"Salut {escape(actor_info['name'])}, le quartier n'attend pas!\n\n"
-        f"{story}\n\n"
-        f"💰 Solde: {balance}$ | 🔥 Recherche: {search_level}/100"
-        f"{f' (+{search_increase})' if search_increase else ''}\n"
+        f"{story}\n"
+        f"💵 Cash: {applied_cash_delta:+d}$ | ✨ XP: +0\n"
+        f"🔥 Heat: {heat_delta:+d} ({updated_player['heat']}/100) | "
+        f"🚨 Recherche: {search_delta:+d} "
+        f"({updated_player['search_level']}/100)\n"
+        f"💰 Solde: {balance}$\n"
         f"⏱️ Prochain hustle dans {hustle.cooldown_seconds}s.",
         parse_mode="HTML",
     )
