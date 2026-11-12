@@ -64,6 +64,28 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(blocked[1], 0)
         self.assertEqual(blocked[2:], (600, 1, 0))
 
+    async def test_cash_rewards_always_grant_at_least_one_xp(self) -> None:
+        await self.database.ensure_player(104, "minimum_xp")
+
+        self.assertTrue(
+            await self.database.apply_action_result(104, 10, 0, None, None)
+        )
+        player = await self.database.get_player(104)
+        self.assertEqual(player["xp"], 1)
+
+        await self.database.apply_hustle_result(104, 0, 15, 5, 0)
+        player = await self.database.get_player(104)
+        self.assertEqual(player["xp"], 2)
+
+        jugg = await self.database.apply_jugg_result(104, 0, 15, 5, 0)
+        self.assertEqual(jugg["xp_gain"], 1)
+        player = await self.database.get_player(104)
+        self.assertEqual(player["xp"], 3)
+
+        await self.database.settle_casino_bet(104, 0, 1, 1)
+        player = await self.database.get_player(104)
+        self.assertEqual(player["xp"], 4)
+
     async def test_hustle_cooldowns_are_bounded_including_existing_profiles(self) -> None:
         await self.database.ensure_player(101, "rabza")
         async with aiosqlite.connect(self.database.path) as connection:
@@ -109,6 +131,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 "heat": 1,
                 "search_level": 1,
                 "xp": 100,
+                "xp_gain": 100,
                 "previous_level": 1,
                 "level": 2,
                 "prison_seconds": 0,

@@ -14,6 +14,11 @@ MIN_HUSTLE_COOLDOWN_SECONDS = 15
 MAX_HUSTLE_COOLDOWN_SECONDS = 30
 
 
+def _reward_xp(xp_gain: int, cash_delta: int) -> int:
+    """Never persist a positive cash reward without at least one XP."""
+    return max(1, xp_gain) if cash_delta > 0 else max(0, xp_gain)
+
+
 def _epoch_timestamp(value: object) -> float | None:
     """Normalize Unix timestamps and legacy ISO timestamps to epoch seconds."""
     if value is None or value == 0:
@@ -446,7 +451,7 @@ class Database:
             if player is None or int(player["cash"]) < stake:
                 await connection.rollback()
                 return None
-            new_xp = int(player["xp"]) + max(0, xp_gain)
+            new_xp = int(player["xp"]) + _reward_xp(xp_gain, net_change)
             new_level = level_for_xp(new_xp)
             cursor = await connection.execute(
                 """
@@ -521,7 +526,7 @@ class Database:
             if current_end_time is not None and current_end_time > now:
                 await connection.rollback()
                 return False
-            new_xp = row["xp"] + max(0, xp_gain)
+            new_xp = row["xp"] + _reward_xp(xp_gain, cash_delta)
             new_level = level_for_xp(new_xp)
             await connection.execute(
                 """
@@ -620,7 +625,7 @@ class Database:
                 100,
                 max(0, int(player["heat"]) + search_level_delta),
             )
-            new_xp = int(player["xp"]) + max(0, xp_gain)
+            new_xp = int(player["xp"]) + _reward_xp(xp_gain, cash_delta)
             new_level = level_for_xp(new_xp)
             await connection.execute(
                 """
@@ -718,7 +723,7 @@ class Database:
                 100, max(0, int(player["search_level"]) + heat_delta)
             )
             new_prison_until = now + prison_seconds if prison_seconds else 0
-            new_xp = int(player["xp"]) + max(0, xp_gain)
+            new_xp = int(player["xp"]) + _reward_xp(xp_gain, cash_delta)
             new_level = level_for_xp(new_xp)
             await connection.execute(
                 """
@@ -750,6 +755,7 @@ class Database:
                 "heat": new_heat,
                 "search_level": new_search_level,
                 "xp": new_xp,
+                "xp_gain": _reward_xp(xp_gain, cash_delta),
                 "previous_level": int(player["level"]),
                 "level": new_level,
                 "prison_seconds": prison_seconds,
@@ -1024,7 +1030,7 @@ class Database:
 
             rate = min(0.35, max(0.15, transfer_rate))
             amount = min(victim["cash"], max(1, int(victim["cash"] * rate)))
-            new_xp = attacker["xp"] + max(0, xp_gain)
+            new_xp = attacker["xp"] + _reward_xp(xp_gain, amount)
             new_level = level_for_xp(new_xp)
             await connection.execute(
                 """

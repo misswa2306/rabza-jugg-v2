@@ -1056,6 +1056,15 @@ def xp_to_next_level(xp: int, level: int) -> int:
     return 100 * level - (xp - 50 * level * (level - 1))
 
 
+def xp_with_bonus(xp: int, bonus_percent: int = 0) -> int:
+    """Apply the player's XP bonus while preserving a positive reward."""
+    if xp < 0 or bonus_percent < 0:
+        raise ValueError("XP et bonus d'XP doivent être positifs ou nuls")
+    if xp == 0:
+        return 0
+    return max(1, xp + xp * bonus_percent // 100)
+
+
 def item_by_id(item_id: str) -> ShopItem | None:
     return next((item for item in ITEMS if item.item_id == item_id), None)
 

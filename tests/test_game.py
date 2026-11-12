@@ -97,7 +97,7 @@ class ResolveActionTests(unittest.TestCase):
         self.assertLessEqual(elapsed, PRISON_DURATION_SECONDS + 0.01)
 
     def test_level_progression_and_level_cap(self) -> None:
-        from game import level_for_xp, xp_to_next_level
+        from game import level_for_xp, xp_to_next_level, xp_with_bonus
 
         self.assertEqual(level_for_xp(99), 1)
         self.assertEqual(level_for_xp(100), 2)
@@ -107,6 +107,35 @@ class ResolveActionTests(unittest.TestCase):
         self.assertEqual(level_for_xp(999999), 60)
         self.assertEqual(xp_to_next_level(300, 3), 300)
         self.assertEqual(xp_to_next_level(177000, 60), 0)
+        self.assertEqual(xp_with_bonus(30, 0), 30)
+        self.assertEqual(xp_with_bonus(30, 20), 36)
+        self.assertEqual(xp_with_bonus(1, 10), 1)
+
+    def test_all_cash_reward_catalogues_assign_positive_xp(self) -> None:
+        from game import ACTION_SPECS, HUSTLES, JUGG_TIERS
+        from bot import MISSIONS
+
+        self.assertTrue(
+            all(
+                action.reward <= 0 or action.xp > 0
+                for action in ACTION_SPECS.values()
+            )
+        )
+        self.assertTrue(
+            all(
+                hustle.success_reward <= 0 or hustle.xp > 0 for hustle in HUSTLES
+            )
+        )
+        self.assertTrue(
+            all(
+                tier.success_reward <= 0 or tier.xp > 0 for tier in JUGG_TIERS
+            )
+        )
+        self.assertTrue(
+            all(
+                mission.reward <= 0 or mission.xp > 0 for mission in MISSIONS
+            )
+        )
 
     def test_action_unlocks_and_obd_gate(self) -> None:
         from game import actions_available

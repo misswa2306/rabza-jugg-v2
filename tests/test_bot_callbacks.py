@@ -1123,6 +1123,22 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Recherche: +0 (0/100)", text)
         self.assertIn("Prochain hustle dans 25s", text)
 
+    async def test_successful_mission_notifies_level_up(self) -> None:
+        temp_dir, database, context, update, message, chat = await self._setup_hustle(
+            ["colis"]
+        )
+        self.addCleanup(temp_dir.cleanup)
+        await database.apply_action_result(
+            888, 0, 0, None, None, xp_gain=95, chat_id=chat.id
+        )
+
+        with patch("bot.random.random", return_value=0.0):
+            await missions(update, context)
+
+        player = await database.get_player(888, chat.id)
+        self.assertEqual((player["xp"], player["level"]), (100, 2))
+        self.assertIn("TU PRENDS DU GALON", message.reply_text.await_args.args[0])
+
     async def test_hustle_requires_existing_profile_and_supports_anonymous_admin(
         self,
     ) -> None:
@@ -1275,6 +1291,7 @@ class JuggCallbackTests(unittest.IsolatedAsyncioTestCase):
         from game import JuggResult
 
         database = AsyncMock()
+        database.get_item_effects.return_value = {"xp_bonus": 0}
         database.apply_jugg_result.return_value = {
             "status": "ok",
             "balance": 1700,
@@ -1282,7 +1299,7 @@ class JuggCallbackTests(unittest.IsolatedAsyncioTestCase):
             "heat_delta": 1,
             "heat": 1,
             "search_level": 1,
-            "xp": 30,
+            "xp_gain": 30,
             "previous_level": 1,
             "level": 1,
             "prison_seconds": 0,

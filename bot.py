@@ -45,6 +45,7 @@ from game import (
     resolve_action,
     resolve_jugg,
     resolve_pvp,
+    xp_with_bonus,
     xp_to_next_level,
 )
 
@@ -614,14 +615,21 @@ async def handle_jugg_tier(
         return
 
     outcome = resolve_jugg(tier_id)
-    applied = await database_for(context).apply_jugg_result(
+    database = database_for(context)
+    effects = await database.get_item_effects(actor_info["id"], chat.id)
+    xp_gain = (
+        xp_with_bonus(tier.xp, int(effects["xp_bonus"]))
+        if outcome.success
+        else 0
+    )
+    applied = await database.apply_jugg_result(
         actor_info["id"],
         chat.id,
         tier.cooldown_seconds,
         outcome.cash_delta,
         outcome.heat_delta,
         outcome.prison_seconds,
-        tier.xp if outcome.success else 0,
+        xp_gain,
     )
     status = applied["status"]
     if status == "missing":
@@ -656,7 +664,7 @@ async def handle_jugg_tier(
         f"🎮 {tier.title}\n"
         f"{formatted_result}\n"
         f"💵 Cash: {cash_delta:+d}$ | Solde: {applied['balance']}$\n"
-        f"✨ XP: +{tier.xp if outcome.success else 0}\n"
+        f"✨ XP: +{applied['xp_gain']}\n"
         f"🔥 Heat: {heat_delta:+d} ({applied['heat']}/100) | "
         f"Recherche: {applied['search_level']}/100\n"
         f"⏱️ Prochain palier dans {applied['cooldown_seconds']}s."
@@ -724,8 +732,7 @@ async def handle_game_action(
         success_bonus=float(effects["success_bonus"]),
     )
     xp_gain = (
-        result.xp_gain
-        + (result.xp_gain * int(effects["xp_bonus"]) // 100)
+        xp_with_bonus(result.xp_gain, int(effects["xp_bonus"]))
         if result.success
         else 0
     )
@@ -1000,7 +1007,7 @@ async def braquer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         result.outcome,
         result.fine,
         deadline,
-        result.xp_gain,
+        xp_with_bonus(result.xp_gain, int(attacker_effects["xp_bonus"])),
         result.transfer_rate,
         chat_id=chat.id,
     )
@@ -1295,13 +1302,15 @@ async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     succeeded = random.random() < mission.success_chance
     if succeeded:
+        effects = await database.get_item_effects(actor_info["id"], chat.id)
+        xp_gain = xp_with_bonus(mission.xp, int(effects["xp_bonus"]))
         applied = await database.apply_action_result(
             actor_info["id"],
             mission.reward,
             0,
             None,
             None,
-            xp_gain=mission.xp,
+            xp_gain=xp_gain,
             chat_id=chat.id,
         )
     else:
@@ -1339,7 +1348,7 @@ async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text(
             f"🏁💨 Mission réussie, {actor_info['name']}!\n"
             f"🚘 {mission.name}\n"
-            f"💵 +{mission.reward}$ | ✨ +{mission.xp} XP\n"
+            f"💵 +{mission.reward}$ | ✨ +{updated_player['xp'] - player['xp']} XP\n"
             f"⭐ Niveau: {updated_player['level']} | "
             f"Solde: {updated_player['cash']}$"
             + level_up_notice(int(player["level"]), int(updated_player["level"]))
@@ -1381,6 +1390,12 @@ async def run_hustle(
         cash_delta = -hustle.failure_penalty
         search_delta = 1
 
+    effects = await database.get_item_effects(actor_info["id"], chat_id)
+    xp_reward = (
+        xp_with_bonus(hustle.xp, int(effects["xp_bonus"]))
+        if succeeded
+        else 0
+    )
     status, remaining, balance, _search_level, applied_cash_delta = (
         await database.apply_hustle_result(
             actor_info["id"],
@@ -1388,7 +1403,7 @@ async def run_hustle(
             hustle.cooldown_seconds,
             cash_delta,
             search_delta,
-            xp_gain=hustle.xp if succeeded else 0,
+            xp_gain=xp_reward,
         )
     )
     if status == "missing":
@@ -1568,6 +1583,7 @@ async def casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         raise RuntimeError(
             f"Le joueur {actor_info['id']} est introuvable avant le pari."
         )
+    effects = await database.get_item_effects(actor_info["id"], chat.id)
 
     net_change = -stake
     if game_name == "blackjack":
@@ -1636,7 +1652,11 @@ async def casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat.id,
         stake,
         net_change,
-        xp_gain=CASINO_WIN_XP if net_change > 0 else 0,
+        xp_gain=(
+            xp_with_bonus(CASINO_WIN_XP, int(effects["xp_bonus"]))
+            if net_change > 0
+            else 0
+        ),
     )
     if new_balance is None:
         current_balance = await database.get_player_balance(actor_info["id"], chat.id)
