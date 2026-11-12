@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+from pathlib import Path
 import time
 from typing import Any, AsyncIterator
 
@@ -58,6 +59,8 @@ class Database:
                 await connection.commit()
 
     async def initialize(self) -> None:
+        if self.path != ":memory:":
+            Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self.path) as connection:
             cursor = await connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
@@ -65,22 +68,54 @@ class Database:
             tables = {row[0] for row in await cursor.fetchall()}
             if "players" in tables:
                 cursor = await connection.execute("PRAGMA table_info(players)")
-                player_columns = {row[1] for row in await cursor.fetchall()}
+                player_info = await cursor.fetchall()
+                player_columns = {row[1] for row in player_info}
+                player_primary_key = [
+                    row[1] for row in sorted(player_info, key=lambda row: row[5])
+                    if row[5]
+                ]
             else:
                 player_columns = set()
+                player_primary_key = []
 
-            if "players" in tables and "chat_id" not in player_columns:
+            migrate_players = "players" in tables and (
+                "chat_id" not in player_columns
+                or player_primary_key != ["chat_id", "user_id"]
+            )
+            players_backup_table: str | None = None
+            inventory_backup_table: str | None = None
+            migrate_inventory = False
+            if "inventory" in tables:
+                cursor = await connection.execute("PRAGMA table_info(inventory)")
+                inventory_info = await cursor.fetchall()
+                inventory_columns = {row[1] for row in inventory_info}
+                inventory_primary_key = [
+                    row[1] for row in sorted(inventory_info, key=lambda row: row[5])
+                    if row[5]
+                ]
+                migrate_inventory = (
+                    "chat_id" not in inventory_columns
+                    or inventory_primary_key
+                    != ["chat_id", "user_id", "item_id"]
+                )
+
+            if migrate_players or migrate_inventory:
                 await connection.execute("PRAGMA foreign_keys = OFF")
                 await connection.execute("BEGIN IMMEDIATE")
-                if "inventory" in tables:
-                    await connection.execute(
-                        "ALTER TABLE inventory RENAME TO inventory_legacy"
+                if "inventory" in tables and (migrate_players or migrate_inventory):
+                    inventory_backup_table = self._legacy_table_name(
+                        "inventory", tables
                     )
-                    tables.add("inventory_legacy")
-                await connection.execute(
-                    "ALTER TABLE players RENAME TO players_legacy"
-                )
-                tables.add("players_legacy")
+                    await connection.execute(
+                        f"ALTER TABLE inventory RENAME TO {inventory_backup_table}"
+                    )
+                    tables.add(inventory_backup_table)
+                if migrate_players:
+                    players_backup_table = self._legacy_table_name("players", tables)
+                    await connection.execute(
+                        f"ALTER TABLE players RENAME TO {players_backup_table}"
+                    )
+                    tables.add(players_backup_table)
                 await connection.execute(
                     """
                     CREATE TABLE players (
@@ -105,66 +140,100 @@ class Database:
                     )
                     """
                 )
+            if "players" not in tables:
+                await connection.execute(
+                    """
+                    CREATE TABLE players (
+                        chat_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        username TEXT,
+                        cash INTEGER NOT NULL DEFAULT 500 CHECK (cash >= 0),
+                        bank INTEGER NOT NULL DEFAULT 0 CHECK (bank >= 0),
+                        balance INTEGER GENERATED ALWAYS AS (cash) VIRTUAL,
+                        heat INTEGER NOT NULL DEFAULT 0 CHECK (heat BETWEEN 0 AND 100),
+                        in_prison_until REAL NOT NULL DEFAULT 0,
+                        gamos TEXT NOT NULL DEFAULT 'Aucun',
+                        level INTEGER NOT NULL DEFAULT 1 CHECK (level BETWEEN 1 AND 60),
+                        xp INTEGER NOT NULL DEFAULT 0 CHECK (xp >= 0),
+                        search_level INTEGER NOT NULL DEFAULT 0
+                            CHECK (search_level BETWEEN 0 AND 100),
+                        last_hustle_time REAL NOT NULL DEFAULT 0,
+                        last_hustle_cooldown INTEGER NOT NULL DEFAULT 0,
+                        last_jugg_time REAL NOT NULL DEFAULT 0,
+                        last_jugg_cooldown INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (chat_id, user_id)
+                    )
+                    """
+                )
+
+            if players_backup_table is not None:
                 cursor = await connection.execute(
-                    "PRAGMA table_info(players_legacy)"
+                    f"PRAGMA table_info({players_backup_table})"
                 )
                 legacy_columns = {row[1] for row in await cursor.fetchall()}
-                level_column = "level" if "level" in legacy_columns else "1"
-                xp_column = "xp" if "xp" in legacy_columns else "0"
-                bank_column = "bank" if "bank" in legacy_columns else "0"
-                search_level_column = (
-                    "search_level"
-                    if "search_level" in legacy_columns
-                    else ("heat" if "heat" in legacy_columns else "0")
-                )
-                last_hustle_column = (
-                    "last_hustle_time"
-                    if "last_hustle_time" in legacy_columns
-                    else "0"
-                )
-                last_hustle_cooldown_column = (
-                    "last_hustle_cooldown"
-                    if "last_hustle_cooldown" in legacy_columns
-                    else "0"
-                )
+                legacy_values = {
+                    "chat_id": "chat_id" if "chat_id" in legacy_columns else "user_id",
+                    "username": "username" if "username" in legacy_columns else "NULL",
+                    "cash": "COALESCE(cash, 500)" if "cash" in legacy_columns else "500",
+                    "bank": "COALESCE(bank, 0)" if "bank" in legacy_columns else "0",
+                    "heat": "COALESCE(heat, 0)" if "heat" in legacy_columns else "0",
+                    "in_prison_until": (
+                        "COALESCE(in_prison_until, 0)"
+                        if "in_prison_until" in legacy_columns
+                        else "0"
+                    ),
+                    "gamos": (
+                        "COALESCE(gamos, 'Aucun')" if "gamos" in legacy_columns
+                        else "'Aucun'"
+                    ),
+                    "level": "COALESCE(level, 1)" if "level" in legacy_columns else "1",
+                    "xp": "COALESCE(xp, 0)" if "xp" in legacy_columns else "0",
+                    "search_level": (
+                        "COALESCE(search_level, 0)"
+                        if "search_level" in legacy_columns
+                        else (
+                            "COALESCE(heat, 0)" if "heat" in legacy_columns else "0"
+                        )
+                    ),
+                    "last_hustle_time": (
+                        "COALESCE(last_hustle_time, 0)"
+                        if "last_hustle_time" in legacy_columns
+                        else "0"
+                    ),
+                    "last_hustle_cooldown": (
+                        "COALESCE(last_hustle_cooldown, 0)"
+                        if "last_hustle_cooldown" in legacy_columns
+                        else "0"
+                    ),
+                    "last_jugg_time": (
+                        "COALESCE(last_jugg_time, 0)"
+                        if "last_jugg_time" in legacy_columns
+                        else "0"
+                    ),
+                    "last_jugg_cooldown": (
+                        "COALESCE(last_jugg_cooldown, 0)"
+                        if "last_jugg_cooldown" in legacy_columns
+                        else "0"
+                    ),
+                }
                 await connection.execute(
                     f"""
                     INSERT INTO players
                         (chat_id, user_id, username, cash, bank, heat,
-                         in_prison_until, gamos, level, xp,
-                         search_level, last_hustle_time,
-                         last_hustle_cooldown)
-                    SELECT user_id, user_id, username, cash, {bank_column}, heat,
-                           COALESCE(in_prison_until, 0), gamos,
-                           {level_column}, {xp_column},
-                           {search_level_column}, {last_hustle_column},
-                           {last_hustle_cooldown_column}
-                    FROM players_legacy
-                    """
-                )
-            elif "players" not in tables:
-                await connection.execute(
-                    """
-                    CREATE TABLE players (
-                        chat_id INTEGER NOT NULL,
-                        user_id INTEGER NOT NULL,
-                        username TEXT,
-                        cash INTEGER NOT NULL DEFAULT 500 CHECK (cash >= 0),
-                        bank INTEGER NOT NULL DEFAULT 0 CHECK (bank >= 0),
-                        balance INTEGER GENERATED ALWAYS AS (cash) VIRTUAL,
-                        heat INTEGER NOT NULL DEFAULT 0 CHECK (heat BETWEEN 0 AND 100),
-                        in_prison_until REAL NOT NULL DEFAULT 0,
-                        gamos TEXT NOT NULL DEFAULT 'Aucun',
-                        level INTEGER NOT NULL DEFAULT 1 CHECK (level BETWEEN 1 AND 60),
-                        xp INTEGER NOT NULL DEFAULT 0 CHECK (xp >= 0),
-                        search_level INTEGER NOT NULL DEFAULT 0
-                            CHECK (search_level BETWEEN 0 AND 100),
-                        last_hustle_time REAL NOT NULL DEFAULT 0,
-                        last_hustle_cooldown INTEGER NOT NULL DEFAULT 0,
-                        last_jugg_time REAL NOT NULL DEFAULT 0,
-                        last_jugg_cooldown INTEGER NOT NULL DEFAULT 0,
-                        PRIMARY KEY (chat_id, user_id)
-                    )
+                         in_prison_until, gamos, level, xp, search_level,
+                         last_hustle_time, last_hustle_cooldown,
+                         last_jugg_time, last_jugg_cooldown)
+                    SELECT {legacy_values["chat_id"]}, user_id,
+                           {legacy_values["username"]}, {legacy_values["cash"]},
+                           {legacy_values["bank"]}, {legacy_values["heat"]},
+                           {legacy_values["in_prison_until"]},
+                           {legacy_values["gamos"]}, {legacy_values["level"]},
+                           {legacy_values["xp"]}, {legacy_values["search_level"]},
+                           {legacy_values["last_hustle_time"]},
+                           {legacy_values["last_hustle_cooldown"]},
+                           {legacy_values["last_jugg_time"]},
+                           {legacy_values["last_jugg_cooldown"]}
+                    FROM {players_backup_table}
                     """
                 )
             cursor = await connection.execute("PRAGMA table_xinfo(players)")
@@ -288,21 +357,52 @@ class Database:
             await connection.execute(
                 "UPDATE players SET in_prison_until = 0 WHERE in_prison_until IS NULL"
             )
-            if "players_legacy" in tables:
-                legacy_inventory_exists = "inventory_legacy" in tables
-                if legacy_inventory_exists:
-                    await connection.execute(
-                        """
-                        INSERT OR IGNORE INTO inventory
-                            (chat_id, user_id, item_id, quantity)
-                        SELECT user_id, user_id, item_id, quantity
-                        FROM inventory_legacy
-                        """
-                    )
-                    await connection.execute("DROP TABLE inventory_legacy")
-                await connection.execute("DROP TABLE players_legacy")
+            if inventory_backup_table is not None:
+                cursor = await connection.execute(
+                    f"PRAGMA table_info({inventory_backup_table})"
+                )
+                legacy_inventory_columns = {
+                    row[1] for row in await cursor.fetchall()
+                }
+                legacy_quantity = (
+                    "COALESCE(inv.quantity, 1)"
+                    if "quantity" in legacy_inventory_columns
+                    else "1"
+                )
+                if "chat_id" in legacy_inventory_columns:
+                    legacy_inventory_select = f"""
+                        SELECT inv.chat_id, inv.user_id, inv.item_id,
+                               {legacy_quantity}
+                        FROM {inventory_backup_table} AS inv
+                        JOIN players AS p
+                          ON p.chat_id = inv.chat_id AND p.user_id = inv.user_id
+                    """
+                else:
+                    legacy_inventory_select = f"""
+                        SELECT p.chat_id, inv.user_id, inv.item_id,
+                               {legacy_quantity}
+                        FROM {inventory_backup_table} AS inv
+                        JOIN players AS p ON p.user_id = inv.user_id
+                    """
+                await connection.execute(
+                    f"""
+                    INSERT OR IGNORE INTO inventory
+                        (chat_id, user_id, item_id, quantity)
+                    {legacy_inventory_select}
+                    """
+                )
             await connection.commit()
-            await connection.execute("PRAGMA foreign_keys = ON")
+            if migrate_players or migrate_inventory:
+                await connection.execute("PRAGMA foreign_keys = ON")
+
+    @staticmethod
+    def _legacy_table_name(table_name: str, tables: set[str]) -> str:
+        candidate = f"{table_name}_legacy"
+        suffix = 2
+        while candidate in tables:
+            candidate = f"{table_name}_legacy_{suffix}"
+            suffix += 1
+        return candidate
 
     async def ensure_player(
         self, user_id: int, username: str | None, chat_id: int = 0

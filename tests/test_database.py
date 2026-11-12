@@ -761,6 +761,62 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(private_inventory, [])
         self.assertEqual([item["item_id"] for item in group_inventory], ["glock_19"])
 
+    async def test_same_player_has_independent_profiles_in_two_groups(self) -> None:
+        user_id = 1313
+        first_group = -100111
+        second_group = -100222
+        await self.database.ensure_player(user_id, "multi_group", first_group)
+        await self.database.ensure_player(user_id, "multi_group", second_group)
+
+        await self.database.apply_action_result(
+            user_id, 200, 0, None, None, xp_gain=80, chat_id=first_group
+        )
+        await self.database.apply_action_result(
+            user_id, 50, 0, None, None, xp_gain=5, chat_id=second_group
+        )
+        await self.database.move_bank_funds(user_id, first_group, 100, True)
+        self.assertEqual(
+            await self.database.purchase_item(user_id, "tech_fleece", first_group),
+            "ok",
+        )
+
+        first_hustle = await self.database.apply_hustle_result(
+            user_id, first_group, 20, 10, 0, xp_gain=20
+        )
+        second_hustle = await self.database.apply_hustle_result(
+            user_id, second_group, 20, 10, 0, xp_gain=1
+        )
+        self.assertEqual(first_hustle[0], "ok")
+        self.assertEqual(second_hustle[0], "ok")
+        await self.database.apply_action_result(
+            user_id,
+            0,
+            0,
+            None,
+            time.time() + PRISON_DURATION_SECONDS,
+            chat_id=first_group,
+        )
+
+        first = await self.database.get_player(user_id, first_group)
+        second = await self.database.get_player(user_id, second_group)
+        self.assertEqual(
+            (first["cash"], first["bank"], first["xp"], first["level"]),
+            (360, 100, 100, 2),
+        )
+        self.assertEqual(
+            (second["cash"], second["bank"], second["xp"], second["level"]),
+            (560, 0, 6, 1),
+        )
+        self.assertGreater(first["in_prison_until"], time.time())
+        self.assertEqual(second["in_prison_until"], 0)
+        self.assertEqual(
+            [item["item_id"] for item in await self.database.get_inventory(
+                user_id, first_group
+            )],
+            ["tech_fleece"],
+        )
+        self.assertEqual(await self.database.get_inventory(user_id, second_group), [])
+
     async def test_initialize_migrates_existing_players_table(self) -> None:
         legacy_path = Path(self.temp_dir.name) / "legacy.sqlite3"
         connection = sqlite3.connect(legacy_path)
@@ -825,6 +881,120 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             [item["item_id"] for item in await migrated.get_inventory(707, 707)],
             ["tech_fleece"],
         )
+        await migrated.initialize()
+        connection = sqlite3.connect(legacy_path)
+        try:
+            retained_tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            legacy_cash = connection.execute(
+                "SELECT cash FROM players_legacy WHERE user_id = 707"
+            ).fetchone()[0]
+            legacy_quantity = connection.execute(
+                "SELECT quantity FROM inventory_legacy WHERE user_id = 707"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertTrue({"players_legacy", "inventory_legacy"} <= retained_tables)
+        self.assertEqual(legacy_cash, 500)
+        self.assertEqual(legacy_quantity, 1)
+
+    async def test_initialize_repairs_non_composite_context_keys_without_data_loss(
+        self,
+    ) -> None:
+        legacy_path = Path(self.temp_dir.name) / "old_context.sqlite3"
+        connection = sqlite3.connect(legacy_path)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE players (
+                    user_id INTEGER PRIMARY KEY,
+                    chat_id INTEGER NOT NULL,
+                    username TEXT,
+                    cash INTEGER NOT NULL DEFAULT 500,
+                    heat INTEGER NOT NULL DEFAULT 0,
+                    in_prison_until REAL NOT NULL DEFAULT 0,
+                    gamos TEXT NOT NULL DEFAULT 'Aucun',
+                    level INTEGER NOT NULL DEFAULT 1,
+                    xp INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE items (
+                    item_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    price INTEGER NOT NULL,
+                    min_level INTEGER NOT NULL,
+                    xp_bonus INTEGER NOT NULL DEFAULT 0,
+                    success_bonus REAL NOT NULL DEFAULT 0
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE inventory (
+                    user_id INTEGER NOT NULL,
+                    item_id TEXT NOT NULL,
+                    quantity INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY (user_id, item_id)
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO players (user_id, chat_id, cash) VALUES (808, 9, 1200)"
+            )
+            connection.execute(
+                "INSERT INTO items VALUES ('tech_fleece', 'Tech Fleece', 'clothes', 250, 1, 5, 0)"
+            )
+            connection.execute(
+                "INSERT INTO inventory (user_id, item_id) VALUES (808, 'tech_fleece')"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = Database(str(legacy_path))
+        await migrated.initialize()
+        await migrated.ensure_player(808, "legacy", 10)
+        first = await migrated.get_player(808, 9)
+        second = await migrated.get_player(808, 10)
+        self.assertEqual(first["cash"], 1200)
+        self.assertEqual(second["cash"], 500)
+        self.assertEqual(
+            [item["item_id"] for item in await migrated.get_inventory(808, 9)],
+            ["tech_fleece"],
+        )
+        self.assertEqual(await migrated.get_inventory(808, 10), [])
+
+        connection = sqlite3.connect(legacy_path)
+        try:
+            primary_key = [
+                row[1]
+                for row in sorted(
+                    connection.execute("PRAGMA table_info(players)").fetchall(),
+                    key=lambda row: row[5],
+                )
+                if row[5]
+            ]
+            retained_cash = connection.execute(
+                "SELECT cash FROM players_legacy WHERE user_id = 808"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(primary_key, ["chat_id", "user_id"])
+        self.assertEqual(retained_cash, 1200)
+
+    async def test_initialize_creates_missing_database_parent_directory(self) -> None:
+        database_path = Path(self.temp_dir.name) / "nested" / "state.sqlite3"
+        database = Database(str(database_path))
+        await database.initialize()
+        self.assertTrue(database_path.is_file())
 
     async def test_initialize_alters_existing_context_players_to_add_bank(self) -> None:
         existing_path = Path(self.temp_dir.name) / "existing.sqlite3"

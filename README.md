@@ -23,7 +23,21 @@ automatiquement. Définis `BOT_TOKEN` dans l'environnement avant de démarrer.
 Ne partage pas le fichier `.env` ni le token.
 
 Le fichier SQLite `rabza_jugg_bot.sqlite3` est créé automatiquement au premier
-lancement. Pour choisir un autre chemin, définis `DATABASE_PATH`.
+lancement, dans le dossier du projet. Un chemin relatif donné par
+`DATABASE_PATH` est également résolu depuis ce dossier, indépendamment du
+dossier courant du processus. Les dossiers parents manquants sont créés au
+démarrage.
+
+Sur Railway (ou tout hébergeur à système de fichiers éphémère), ces réglages
+ne remplacent pas un volume persistant : attache un volume au service, monte-le
+par exemple sur `/data`, puis définis `DATABASE_PATH` à
+`/data/rabza_jugg_bot.sqlite3`. Garde le même chemin de montage lors des
+redéploiements. Sans volume persistant, les données locales au conteneur ne
+peuvent pas être garanties après un redéploiement.
+
+Les migrations gardent les anciennes tables `players_legacy` et
+`inventory_legacy` comme sauvegardes après copie. Ne les supprime qu'après
+avoir vérifié une sauvegarde externe et les données migrées.
 Les comptes, inventaires et peines sont isolés par conversation Telegram:
 un même utilisateur a donc un état distinct en privé et dans chaque groupe.
 `/braquer @username` est disponible uniquement dans un groupe ou supergroupe.
