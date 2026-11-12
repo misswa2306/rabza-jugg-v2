@@ -13,7 +13,9 @@ from bot import (
     HUSTLES,
     blackjack_hand_value,
     braquer,
+    bank,
     casino,
+    deposit,
     edit_callback_message,
     help_command,
     handle_game_action,
@@ -25,6 +27,7 @@ from bot import (
     profil,
     give_command,
     handle_jugg_tier,
+    handle_bank_callback,
     main as bot_main,
     jugg,
     mission_colis,
@@ -36,6 +39,7 @@ from bot import (
     prison_remaining_seconds,
     shop_callback,
     start,
+    withdraw,
 )
 from config import validate_config
 from database import Database
@@ -104,10 +108,14 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
         for command in (
             "/start",
             "/profil",
+            "/bank",
+            "/deposit",
+            "/withdraw",
             "/give",
             "/casino",
             "/missions",
             "/mission",
+            "/hustle",
             "/mission_colis",
             "/mission_phishing",
             "/mission_catalyseur",
@@ -140,10 +148,14 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
             for command in (
                 "start",
                 "profil",
+                "bank",
+                "deposit",
+                "withdraw",
                 "give",
                 "casino",
                 "missions",
                 "mission",
+                "hustle",
                 "mission_colis",
                 "mission_phishing",
                 "mission_catalyseur",
@@ -217,6 +229,21 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
                 for handler in handlers
             )
         )
+        for command in ("bank", "deposit", "withdraw", "hustle"):
+            self.assertTrue(
+                any(
+                    isinstance(handler, CommandHandler)
+                    and command in handler.commands
+                    for handler in handlers
+                )
+            )
+        self.assertTrue(
+            any(
+                isinstance(handler, CallbackQueryHandler)
+                and handler.pattern.pattern == r"^bank:"
+                for handler in handlers
+            )
+        )
         self.assertTrue(
             any(
                 isinstance(handler, CallbackQueryHandler)
@@ -224,6 +251,59 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
                 for handler in handlers
             )
         )
+
+
+class BankCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bank_menu_and_commands_move_money_in_both_directions(self) -> None:
+        temp_dir = TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        database = Database(str(Path(temp_dir.name) / "bank.sqlite3"))
+        await database.initialize()
+        await database.ensure_player(111, "bank_player", -1001)
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database}),
+            args=[],
+        )
+        message = SimpleNamespace(reply_text=AsyncMock(), sender_chat=None)
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=111, username="bank_player", full_name="Bank Player", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
+            effective_message=message,
+        )
+
+        await bank(update, context)
+
+        menu_text = message.reply_text.await_args.args[0]
+        self.assertIn("Cash liquide: 500$", menu_text)
+        self.assertIn("Solde bancaire: 0$", menu_text)
+        buttons = message.reply_text.await_args.kwargs["reply_markup"].inline_keyboard
+        self.assertEqual(buttons[0][0].callback_data, "bank:111:deposit_all")
+        self.assertEqual(buttons[1][0].callback_data, "bank:111:withdraw_all")
+
+        context.args = ["all"]
+        await deposit(update, context)
+        player = await database.get_player(111, -1001)
+        self.assertEqual((player["cash"], player["bank"]), (0, 500))
+        self.assertIn("Dépôt de 500$", message.reply_text.await_args.args[0])
+
+        context.args = ["100"]
+        await withdraw(update, context)
+        player = await database.get_player(111, -1001)
+        self.assertEqual((player["cash"], player["bank"]), (100, 400))
+
+        query = AsyncMock(data="bank:111:withdraw_all")
+        callback_update = SimpleNamespace(
+            callback_query=query,
+            effective_user=update.effective_user,
+            effective_chat=update.effective_chat,
+            effective_message=message,
+        )
+        await handle_bank_callback(callback_update, context)
+        player = await database.get_player(111, -1001)
+        self.assertEqual((player["cash"], player["bank"]), (500, 0))
+        self.assertIn("Retrait de 400$", query.edit_message_text.await_args.args[0])
 
 
 class GiveCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -650,6 +730,7 @@ class GroupPlayerContextTests(unittest.IsolatedAsyncioTestCase):
                     "user_id": -100789,
                     "username": "Admin anonyme",
                     "cash": 500,
+                    "bank": 0,
                     "balance": 500,
                     "heat": 0,
                     "in_prison_until": 0,
@@ -743,9 +824,11 @@ class CasinoTests(unittest.IsolatedAsyncioTestCase):
             await casino(update, context)
 
         self.assertEqual(await database.get_player_balance(chat_id, chat_id), 600)
+        self.assertEqual((await database.get_player(chat_id, chat_id))["xp"], 5)
         text = message.reply_text.await_args.args[0]
         self.assertIn("Roulette pour Admin de Montréal", text)
         self.assertIn("Nouveau solde: 600$", text)
+        self.assertIn("+5 XP", text)
 
     async def test_blackjack_natural_pays_one_and_a_half_times_the_stake(
         self,
@@ -766,6 +849,7 @@ class CasinoTests(unittest.IsolatedAsyncioTestCase):
             await casino(update, context)
 
         self.assertEqual(await database.get_player_balance(44, chat_id), 651)
+        self.assertEqual((await database.get_player(44, chat_id))["xp"], 5)
         self.assertIn(
             "Blackjack! Tu gagnes 151$ net",
             message.reply_text.await_args.args[0],
@@ -867,6 +951,22 @@ class MissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(player["level"], 1)
         self.assertIn("Mission réussie", message.reply_text.await_args.args[0])
 
+    async def test_mission_notifies_immediately_when_xp_reaches_level_threshold(self) -> None:
+        temp_dir, database, context, update, message, chat = await self._setup_mission(
+            ["civic"]
+        )
+        self.addCleanup(temp_dir.cleanup)
+        await database.apply_action_result(
+            777, 0, 0, None, None, xp_gain=90, chat_id=chat.id
+        )
+
+        with patch("bot.random.random", return_value=0.0):
+            await missions(update, context)
+
+        player = await database.get_player(777, chat.id)
+        self.assertEqual((player["xp"], player["level"]), (110, 2))
+        self.assertIn("TU PRENDS DU GALON", message.reply_text.await_args.args[0])
+
     async def test_locked_mission_does_not_change_player_balance(self) -> None:
         temp_dir, database, context, update, message, chat = await self._setup_mission(
             ["audi"]
@@ -950,6 +1050,7 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/mission_colis", text)
         self.assertIn("/mission_phishing", text)
         self.assertIn("Cooldown: 20s", text)
+        self.assertIn("Gain fixe: 115$ | XP: 5", text)
 
     async def test_hustle_pays_fixed_reward_and_enforces_global_cooldown(self) -> None:
         temp_dir, database, context, update, message, chat = await self._setup_hustle(
@@ -999,7 +1100,7 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
     async def test_successful_hustle_uses_scenario_and_reports_all_game_deltas(
         self,
     ) -> None:
-        temp_dir, _, context, update, message, _ = await self._setup_hustle(
+        temp_dir, database, context, update, message, _ = await self._setup_hustle(
             ["phishing"]
         )
         self.addCleanup(temp_dir.cleanup)
@@ -1015,7 +1116,9 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
 
         text = message.reply_text.await_args.args[0]
         self.assertIn(scenario, text)
-        self.assertIn("Cash: +275$ | ✨ XP: +0", text)
+        self.assertIn("Cash: +275$ | ✨ XP: +10", text)
+        player = await database.get_player(888, -100888)
+        self.assertEqual((player["xp"], player["level"]), (10, 1))
         self.assertIn("Heat: +0 (0/100)", text)
         self.assertIn("Recherche: +0 (0/100)", text)
         self.assertIn("Prochain hustle dans 25s", text)
@@ -1179,6 +1282,9 @@ class JuggCallbackTests(unittest.IsolatedAsyncioTestCase):
             "heat_delta": 1,
             "heat": 1,
             "search_level": 1,
+            "xp": 30,
+            "previous_level": 1,
+            "level": 1,
             "prison_seconds": 0,
             "cooldown_seconds": 15,
         }
@@ -1202,10 +1308,11 @@ class JuggCallbackTests(unittest.IsolatedAsyncioTestCase):
             await handle_jugg_tier(update, context)
 
         database.apply_jugg_result.assert_awaited_once_with(
-            101, -1001, 15, 1200, 1, 0
+            101, -1001, 15, 1200, 1, 0, 30
         )
         text = query.edit_message_text.await_args.args[0]
         self.assertIn("Cash: +1200$ | Solde: 1700$", text)
+        self.assertIn("XP: +30", text)
         self.assertIn("Prochain palier dans 15s", text)
 
     async def test_jugg_callback_shows_precise_remaining_cooldown(self) -> None:

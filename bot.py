@@ -110,6 +110,16 @@ MISSIONS = (
 ROULETTE_RED_NUMBERS = frozenset(
     {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
 )
+CASINO_WIN_XP = 5
+
+
+def level_up_notice(previous_level: int, new_level: int) -> str:
+    if new_level <= previous_level:
+        return ""
+    return (
+        "\n\n🎖️✨ TU PRENDS DU GALON! ✨🎖️\n"
+        f"⭐ Niveau {previous_level} → {new_level} — le game évolue!"
+    )
 
 
 async def edit_callback_message(
@@ -328,6 +338,9 @@ async def help_command(
         "👤 Profil et progression\n"
         "/start — démarrer le bot\n"
         "/profil — consulter cash, niveau, XP et statut\n"
+        "/bank — consulter la banque et déposer/retirer tout ton cash\n"
+        "/deposit <montant/all> — déposer du cash à la banque\n"
+        "/withdraw <montant/all> — retirer du cash de la banque\n"
         "/top — classement du groupe\n"
         "/give <montant> — envoyer du cash en répondant à un joueur\n"
         "/give @username <montant> — envoyer du cash à un joueur\n"
@@ -337,6 +350,7 @@ async def help_command(
         "/jugg ou /juggling — ouvrir le menu des paliers d'arcade\n"
         "/missions — afficher les missions et les niveaux requis\n"
         "/mission <id> — lancer une mission (ex. /mission civic)\n"
+        "/hustle <id> — lancer un défi d'arcade (ex. /hustle colis)\n"
         "/mission_colis — défi de livraison (cooldown 20s, 115$)\n"
         "/mission_phishing — défi de sensibilisation numérique (cooldown 25s, 275$)\n"
         "/mission_catalyseur — défi mécanique (cooldown 30s, 475$)\n"
@@ -384,6 +398,7 @@ async def profil(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_text(
         f"📍 Profil de {actor_info['name']}\n"
         f"💵 Kob: {player['cash']}$\n"
+        f"🏦 Banque: {player['bank']}$\n"
         f"🚘 Gamos: {player['gamos']}\n"
         f"🔥 Heat: {player['heat']}/100\n"
         f"🚨 Recherche: {player['search_level']}/100\n"
@@ -393,6 +408,127 @@ async def profil(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🎒 Inventaire: {inventory_text}\n"
         f"🚔 Statut: {status}"
     )
+
+
+async def bank(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    actor = await player_context(update, context)
+    if actor is None:
+        return
+    actor_info, chat, message = actor
+    player = await database_for(context).get_player(actor_info["id"], chat.id)
+    if player is None:
+        raise RuntimeError(
+            f"Le joueur {actor_info['id']} est introuvable après son enregistrement."
+        )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🏦 Déposer tout le cash",
+                    callback_data=f"bank:{actor_info['id']}:deposit_all",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "💵 Retirer tout",
+                    callback_data=f"bank:{actor_info['id']}:withdraw_all",
+                )
+            ],
+        ]
+    )
+    await message.reply_text(
+        f"🏦 Banque sécurisée\n"
+        f"💵 Cash liquide: {player['cash']}$\n"
+        f"🏦 Solde bancaire: {player['bank']}$\n\n"
+        "L'argent en banque est protégé contre les pertes de jeu. "
+        "Utilise /deposit <montant/all> ou /withdraw <montant/all>.",
+        reply_markup=keyboard,
+    )
+
+
+def bank_transfer_text(
+    result: dict[str, int | str], deposit: bool
+) -> str:
+    status = result["status"]
+    action = "dépôt" if deposit else "retrait"
+    if status == "missing":
+        return "Profil introuvable. Tape /start."
+    if status == "invalid":
+        return "Le montant doit être un entier strictement positif."
+    if status == "empty":
+        return (
+            "Aucun cash liquide à déposer."
+            if deposit
+            else "Ton compte bancaire est vide."
+        )
+    if status == "insufficient":
+        return "Solde insuffisant pour effectuer ce virement."
+    if status != "ok":
+        raise RuntimeError(f"Résultat bancaire inattendu: {status!r}")
+    return (
+        f"✅ {action.capitalize()} de {result['amount']}$ effectué.\n"
+        f"💵 Cash: {result['cash']}$ | 🏦 Banque: {result['bank']}$"
+    )
+
+
+async def bank_transfer_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    deposit: bool,
+) -> None:
+    actor = await player_context(update, context)
+    if actor is None:
+        return
+    actor_info, chat, message = actor
+    command = "/deposit" if deposit else "/withdraw"
+    if len(context.args) != 1:
+        await message.reply_text(f"Usage: {command} <montant/all>")
+        return
+    value = context.args[0].casefold()
+    if value == "all":
+        amount = None
+    elif value.isdecimal():
+        amount = int(value)
+    else:
+        await message.reply_text(f"Usage: {command} <montant/all>")
+        return
+    result = await database_for(context).move_bank_funds(
+        actor_info["id"], chat.id, amount, deposit
+    )
+    await message.reply_text(bank_transfer_text(result, deposit))
+
+
+async def deposit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await bank_transfer_command(update, context, deposit=True)
+
+
+async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await bank_transfer_command(update, context, deposit=False)
+
+
+async def handle_bank_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    callback_actor = callback_actor_info(update, query.data, "bank")
+    if callback_actor is None:
+        return
+    actor_info, action = callback_actor
+    if action not in {"deposit_all", "withdraw_all"}:
+        await edit_callback_message(query, "Cette opération bancaire n'existe pas.")
+        return
+    actor = await player_context(update, context, actor_info)
+    if actor is None:
+        return
+    chat = actor[1]
+    deposit_funds = action == "deposit_all"
+    result = await database_for(context).move_bank_funds(
+        actor_info["id"], chat.id, None, deposit_funds
+    )
+    await edit_callback_message(query, bank_transfer_text(result, deposit_funds))
 
 
 async def jugg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -420,7 +556,8 @@ async def jugg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [
             InlineKeyboardButton(
                 f"{tier.title} — jusqu'à {tier.success_reward}$ "
-                f"(risque {1 - tier.success_chance:.0%}, cooldown {tier.cooldown_seconds}s)",
+                f"(+{tier.xp} XP, risque {1 - tier.success_chance:.0%}, "
+                f"cooldown {tier.cooldown_seconds}s)",
                 callback_data=f"jugg:{actor_info['id']}:{tier.tier_id}",
             )
         ]
@@ -484,6 +621,7 @@ async def handle_jugg_tier(
         outcome.cash_delta,
         outcome.heat_delta,
         outcome.prison_seconds,
+        tier.xp if outcome.success else 0,
     )
     status = applied["status"]
     if status == "missing":
@@ -518,9 +656,13 @@ async def handle_jugg_tier(
         f"🎮 {tier.title}\n"
         f"{formatted_result}\n"
         f"💵 Cash: {cash_delta:+d}$ | Solde: {applied['balance']}$\n"
+        f"✨ XP: +{tier.xp if outcome.success else 0}\n"
         f"🔥 Heat: {heat_delta:+d} ({applied['heat']}/100) | "
         f"Recherche: {applied['search_level']}/100\n"
-        f"⏱️ Prochain palier dans {applied['cooldown_seconds']}s.",
+        f"⏱️ Prochain palier dans {applied['cooldown_seconds']}s."
+        + level_up_notice(
+            int(applied["previous_level"]), int(applied["level"])
+        ),
     )
 
 
@@ -608,14 +750,18 @@ async def handle_game_action(
             "Check /prison avant de retenter un jugg."
         )
         return
+    updated_player = await database.get_player(actor_info["id"], chat.id)
+    if updated_player is None:
+        raise RuntimeError(f"Le joueur {actor_info['id']} est introuvable.")
     await edit_callback_message(
         query,
         f"{result.message}"
         + (
-            f"\nBonus de vêtements et accessoires inclus; +{xp_gain} XP total."
+            f"\n✨ +{xp_gain} XP total."
             if result.success
             else ""
         )
+        + level_up_notice(int(player["level"]), int(updated_player["level"]))
         + "\n\nPour voir tes stats: /profil"
     )
 
@@ -878,6 +1024,7 @@ async def braquer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"🎯 Tu as braqué @{victim['username']} dans le jeu et tu es reparti "
             f"avec {applied['amount']}$ ({applied['rate']:.0%} du cash) ! "
             f"+{applied['xp']} XP. Niveau actuel: {applied['level']}."
+            + level_up_notice(int(attacker["level"]), int(applied["level"]))
         )
     else:
         await message.reply_text(
@@ -1103,9 +1250,10 @@ async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             for mission in MISSIONS
         )
         lines.extend(
-            f"\n💼 {hustle.name} (/mission_{hustle.mission_id})\n"
+            f"\n💼 {hustle.name} (/hustle {hustle.mission_id} ou "
+            f"/mission_{hustle.mission_id})\n"
             f"Réussite: {hustle.success_chance:.0%} | "
-            f"Gain fixe: {hustle.success_reward}$ | XP: 0 | "
+            f"Gain fixe: {hustle.success_reward}$ | XP: {hustle.xp} | "
             f"Échec: -{hustle.failure_penalty}$ | "
             f"Cooldown: {hustle.cooldown_seconds}s"
             for hustle in HUSTLES
@@ -1194,6 +1342,7 @@ async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"💵 +{mission.reward}$ | ✨ +{mission.xp} XP\n"
             f"⭐ Niveau: {updated_player['level']} | "
             f"Solde: {updated_player['cash']}$"
+            + level_up_notice(int(player["level"]), int(updated_player["level"]))
         )
         return
 
@@ -1239,6 +1388,7 @@ async def run_hustle(
             hustle.cooldown_seconds,
             cash_delta,
             search_delta,
+            xp_gain=hustle.xp if succeeded else 0,
         )
     )
     if status == "missing":
@@ -1273,17 +1423,19 @@ async def run_hustle(
             f"❌ Le défi échoue: l'arcade applique une pénalité fixe de "
             f"<b>{-applied_cash_delta}$</b>."
         )
+    xp_gain = max(0, int(updated_player["xp"]) - int(player["xp"]))
     await message.reply_text(
         f"💼 <b>{escape(hustle.name)}</b>\n"
         f"Salut {escape(actor_info['name'])}, le quartier n'attend pas!\n\n"
         f"{story}\n"
         f"💵 Cash: {applied_cash_delta:+d}$ | "
-        "✨ XP: +0\n"
+        f"✨ XP: +{xp_gain}\n"
         f"🔥 Heat: {heat_delta:+d} ({updated_player['heat']}/100) | "
         f"🚨 Recherche: {search_delta:+d} "
         f"({updated_player['search_level']}/100)\n"
         f"💰 Solde: {balance}$\n"
-        f"⏱️ Prochain hustle dans {hustle.cooldown_seconds}s.",
+        f"⏱️ Prochain hustle dans {hustle.cooldown_seconds}s."
+        + level_up_notice(int(player["level"]), int(updated_player["level"])),
         parse_mode="HTML",
     )
 
@@ -1298,6 +1450,12 @@ async def hustle_command(
         return
     actor_info, chat, message = actor
     await run_hustle(actor_info, chat.id, message, database_for(context), hustle)
+
+
+async def hustle_alias(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    await missions(update, context)
 
 
 async def mission_colis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1405,6 +1563,11 @@ async def casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"({balance}$)."
         )
         return
+    player_before = await database.get_player(actor_info["id"], chat.id)
+    if player_before is None:
+        raise RuntimeError(
+            f"Le joueur {actor_info['id']} est introuvable avant le pari."
+        )
 
     net_change = -stake
     if game_name == "blackjack":
@@ -1469,7 +1632,11 @@ async def casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     new_balance = await database.settle_casino_bet(
-        actor_info["id"], chat.id, stake, net_change
+        actor_info["id"],
+        chat.id,
+        stake,
+        net_change,
+        xp_gain=CASINO_WIN_XP if net_change > 0 else 0,
     )
     if new_balance is None:
         current_balance = await database.get_player_balance(actor_info["id"], chat.id)
@@ -1483,7 +1650,17 @@ async def casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    await message.reply_text(f"{result_text}\n💵 Nouveau solde: {new_balance}$.")
+    player_after = await database.get_player(actor_info["id"], chat.id)
+    if player_after is None:
+        raise RuntimeError(
+            f"Le joueur {actor_info['id']} est introuvable après le pari."
+        )
+    xp_gain = max(0, int(player_after["xp"]) - int(player_before["xp"]))
+    await message.reply_text(
+        f"{result_text}\n💵 Nouveau solde: {new_balance}$."
+        + (f"\n✨ +{xp_gain} XP" if xp_gain else "")
+        + level_up_notice(int(player_before["level"]), int(player_after["level"]))
+    )
 
 
 async def missions_command(
@@ -1558,6 +1735,9 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("profil", profil))
+    application.add_handler(CommandHandler("bank", bank))
+    application.add_handler(CommandHandler("deposit", deposit))
+    application.add_handler(CommandHandler("withdraw", withdraw))
     application.add_handler(CommandHandler("give", give_command))
     application.add_handler(CommandHandler("jugg", jugg))
     application.add_handler(CommandHandler("juggling", jugg))
@@ -1569,6 +1749,7 @@ def main() -> None:
     application.add_handler(CommandHandler("evade", evade))
     application.add_handler(CommandHandler("missions", missions_command))
     application.add_handler(CommandHandler("mission", mission_command))
+    application.add_handler(CommandHandler("hustle", hustle_alias))
     application.add_handler(CommandHandler("mission_colis", mission_colis))
     application.add_handler(CommandHandler("mission_phishing", mission_phishing))
     application.add_handler(CommandHandler("mission_catalyseur", mission_catalyseur))
@@ -1576,6 +1757,12 @@ def main() -> None:
     application.add_handler(CommandHandler("mission_depanneur", mission_depanneur))
     application.add_handler(CommandHandler("mission_sneakers", mission_sneakers))
     application.add_handler(CommandHandler("casino", casino_command))
+    application.add_handler(
+        CallbackQueryHandler(
+            handle_bank_callback,
+            pattern=r"^bank:",
+        )
+    )
     application.add_handler(
         CallbackQueryHandler(
             handle_jugg_tier,

@@ -48,7 +48,9 @@ Ne publie jamais le token dans le code ou dans un dépôt.
 
 - `/help` — liste des commandes disponibles
 - `/start` — inscription et accueil
-- `/profil` — cash, gamos, heat et statut
+- `/profil` — cash, banque, gamos, heat et statut
+- `/bank` — consulter cash et banque; boutons pour déposer ou retirer tout
+- `/deposit <montant/all>` et `/withdraw <montant/all>` — gérer le compte bancaire
 - `/give <montant>` — envoyer du cash en répondant au message d'un joueur
 - `/give @username <montant>` — envoyer du cash à un joueur inscrit dans le groupe
 - `/jugg` ou `/juggling` — menu d'arcade avec trois paliers à récompenses fixes,
@@ -60,7 +62,7 @@ Ne publie jamais le token dans le code ou dans un dépôt.
 - `/top` — classement des dix joueurs les plus riches du contexte courant
 - `/prison` — temps restant et option de caution (300$)
 - `/evade` — tentative d'évasion fictive; un échec prolonge la peine
-- `/missions` ou `/mission` — catalogue de missions fictives et récompenses
+- `/missions`, `/mission` ou `/hustle` — catalogue et défis fictifs avec cash et XP
 - `/mission_colis`, `/mission_phishing`, `/mission_catalyseur`,
   `/mission_vapote`, `/mission_depanneur` et `/mission_sneakers` — défis
   d'arcade à récompenses fixes, avec amende de jeu et hausse de l'indice de
@@ -80,9 +82,11 @@ Les missions se lancent avec un identifiant, par exemple `/mission civic`.
 Elles sont débloquées par niveau, accordent du cash et de l'XP en cas de
 réussite, et peuvent entraîner une amende ou une peine de jeu en cas d'échec.
 Le menu `/missions` affiche aussi les défis disponibles. Chaque défi a
-son taux de réussite, une récompense fixe, une pénalité fixe en cas d'échec et
-son cooldown. Les réussites n'accordent pas d'XP. Le cooldown global persistant
-est enregistré avec le profil du joueur dans chaque conversation.
+son taux de réussite, une récompense fixe en cash et en XP, une pénalité fixe
+en cas d'échec et son cooldown. Les succès des activités et des missions
+créditent l'XP et mettent à jour le niveau; un message annonce chaque niveau
+gagné. Le cooldown global persistant est enregistré avec le profil du joueur
+dans chaque conversation.
 Les profils existants sont migrés pour conserver le cash, le niveau et le XP,
 et ajouter l'indice de recherche ainsi que l'horodatage du dernier hustle.
 Les valeurs sont: colis (85%, +115$/−25$, 20 s), phishing (70%,
@@ -101,6 +105,10 @@ paie 1× sur une victoire classique et 1,5× pour un blackjack naturel. Une
 Les niveaux vont de 1 à 60. Le prochain niveau coûte 100 × niveau XP
 (par exemple 100 XP du niveau 1 au 2, puis 200 XP du niveau 2 au 3).
 L'XP est persisté avec les joueurs; la base existante est migrée au lancement.
+Le solde bancaire est persisté séparément du cash liquide et n'est pas touché
+par les amendes, la taule ou les défis PVP simulés. Les dépôts et retraits sont
+atomiques et peuvent être réalisés avec les boutons de `/bank` ou les commandes
+`/deposit` et `/withdraw`.
 Le catalogue Vêtements & Accessoires comprend plus de 20 pièces supplémentaires,
 réparties entre tête et visage, corps et vestes, accessoires et sacoches, et
 chaussures. Chaque fiche présente son prix, son niveau requis, sa description

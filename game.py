@@ -48,6 +48,7 @@ class HustleSpec:
     success_reward: int
     failure_penalty: int
     cooldown_seconds: int
+    xp: int
     success_message: str
 
 
@@ -60,6 +61,7 @@ class JuggTierSpec:
     failure_fine: int
     cooldown_seconds: int
     success_heat: int
+    xp: int
 
 
 @dataclass(frozen=True)
@@ -72,9 +74,9 @@ class JuggResult:
 
 
 JUGG_TIERS = (
-    JuggTierSpec("bloc", "⚡ Petit Hustle de Bloc", 1200, 0.85, 150, 15, 1),
+    JuggTierSpec("bloc", "⚡ Petit Hustle de Bloc", 1200, 0.85, 150, 15, 1, 30),
     JuggTierSpec(
-        "centre_ville", "🔥 Gros Business Centre-Ville", 4500, 0.60, 700, 25, 3
+        "centre_ville", "🔥 Gros Business Centre-Ville", 4500, 0.60, 700, 25, 3, 75
     ),
     JuggTierSpec(
         "international",
@@ -84,6 +86,7 @@ JUGG_TIERS = (
         2500,
         30,
         5,
+        150,
     ),
 )
 
@@ -96,6 +99,7 @@ HUSTLES = (
         115,
         25,
         20,
+        5,
         "📦 Livraison arcade terminée: tu as validé les étapes du parcours "
         "Plateau–St-Léonard. Le jeu crédite {cash}$ pour ce score.",
     ),
@@ -106,6 +110,7 @@ HUSTLES = (
         275,
         30,
         25,
+        10,
         "📲 Simulation SMS Interac réussie: tu as repéré les signaux d'alerte "
         "dans le scénario d'entraînement. Les points de la manche valent "
         "{cash}$ dans le jeu.",
@@ -117,6 +122,7 @@ HUSTLES = (
         475,
         35,
         30,
+        15,
         "🔧 Épreuve mécanique arcade terminée: tu as complété les contrôles "
         "virtuels de la Civic dans le temps imparti. Récompense fixe: {cash}$.",
     ),
@@ -127,6 +133,7 @@ HUSTLES = (
         65,
         20,
         15,
+        3,
         "🧃 Défi de kiosque terminé au Cégep: tu as atteint l'objectif de "
         "service du mini-jeu. Le score ajoute {cash}$ à ta caisse d'arcade.",
     ),
@@ -137,6 +144,7 @@ HUSTLES = (
         900,
         50,
         30,
+        25,
         "🏪 Parcours chronométré du dépanneur complété dans le mini-jeu: "
         "tous les checkpoints sont validés. Récompense fixe: {cash}$.",
     ),
@@ -147,6 +155,7 @@ HUSTLES = (
         400,
         25,
         25,
+        15,
         "👟 Défi de collection terminé: tu as complété la tournée de baskets "
         "dans le marché virtuel. Le score de la partie rapporte {cash}$.",
     ),

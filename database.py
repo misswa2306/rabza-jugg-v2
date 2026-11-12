@@ -83,6 +83,7 @@ class Database:
                         user_id INTEGER NOT NULL,
                         username TEXT,
                         cash INTEGER NOT NULL DEFAULT 500 CHECK (cash >= 0),
+                        bank INTEGER NOT NULL DEFAULT 0 CHECK (bank >= 0),
                         balance INTEGER GENERATED ALWAYS AS (cash) VIRTUAL,
                         heat INTEGER NOT NULL DEFAULT 0 CHECK (heat BETWEEN 0 AND 100),
                         in_prison_until REAL NOT NULL DEFAULT 0,
@@ -105,6 +106,7 @@ class Database:
                 legacy_columns = {row[1] for row in await cursor.fetchall()}
                 level_column = "level" if "level" in legacy_columns else "1"
                 xp_column = "xp" if "xp" in legacy_columns else "0"
+                bank_column = "bank" if "bank" in legacy_columns else "0"
                 search_level_column = (
                     "search_level"
                     if "search_level" in legacy_columns
@@ -123,11 +125,11 @@ class Database:
                 await connection.execute(
                     f"""
                     INSERT INTO players
-                        (chat_id, user_id, username, cash, heat,
+                        (chat_id, user_id, username, cash, bank, heat,
                          in_prison_until, gamos, level, xp,
                          search_level, last_hustle_time,
                          last_hustle_cooldown)
-                    SELECT user_id, user_id, username, cash, heat,
+                    SELECT user_id, user_id, username, cash, {bank_column}, heat,
                            COALESCE(in_prison_until, 0), gamos,
                            {level_column}, {xp_column},
                            {search_level_column}, {last_hustle_column},
@@ -143,6 +145,7 @@ class Database:
                         user_id INTEGER NOT NULL,
                         username TEXT,
                         cash INTEGER NOT NULL DEFAULT 500 CHECK (cash >= 0),
+                        bank INTEGER NOT NULL DEFAULT 0 CHECK (bank >= 0),
                         balance INTEGER GENERATED ALWAYS AS (cash) VIRTUAL,
                         heat INTEGER NOT NULL DEFAULT 0 CHECK (heat BETWEEN 0 AND 100),
                         in_prison_until REAL NOT NULL DEFAULT 0,
@@ -166,6 +169,13 @@ class Database:
                     """
                     ALTER TABLE players
                     ADD COLUMN balance INTEGER GENERATED ALWAYS AS (cash) VIRTUAL
+                    """
+                )
+            if "bank" not in player_columns:
+                await connection.execute(
+                    """
+                    ALTER TABLE players ADD COLUMN bank INTEGER
+                    NOT NULL DEFAULT 0 CHECK (bank >= 0)
                     """
                 )
             if "search_level" not in player_columns:
@@ -311,7 +321,7 @@ class Database:
             connection.row_factory = aiosqlite.Row
             cursor = await connection.execute(
                 """
-                SELECT user_id, username, cash, balance, heat,
+                SELECT user_id, username, cash, bank, balance, heat,
                        in_prison_until, gamos,
                        level, xp, search_level, last_hustle_time,
                        last_hustle_cooldown, last_jugg_time,
@@ -348,23 +358,103 @@ class Database:
             row = await cursor.fetchone()
             return int(row[0]) if row is not None else None
 
+    async def move_bank_funds(
+        self,
+        user_id: int,
+        chat_id: int,
+        amount: int | None,
+        deposit: bool,
+    ) -> dict[str, int | str]:
+        """Move cash between a player's wallet and protected bank atomically."""
+        if amount is not None and amount <= 0:
+            return {"status": "invalid"}
+
+        async with self.transaction() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT cash, bank FROM players
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (user_id, chat_id),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return {"status": "missing"}
+
+            cash, bank = int(row[0]), int(row[1])
+            available = cash if deposit else bank
+            if available <= 0:
+                return {"status": "empty"}
+            moved = available if amount is None else amount
+            if moved > available:
+                return {"status": "insufficient"}
+
+            if deposit:
+                await connection.execute(
+                    """
+                    UPDATE players SET cash = cash - ?, bank = bank + ?
+                    WHERE user_id = ? AND chat_id = ? AND cash >= ?
+                    """,
+                    (moved, moved, user_id, chat_id, moved),
+                )
+            else:
+                await connection.execute(
+                    """
+                    UPDATE players SET cash = cash + ?, bank = bank - ?
+                    WHERE user_id = ? AND chat_id = ? AND bank >= ?
+                    """,
+                    (moved, moved, user_id, chat_id, moved),
+                )
+
+            cursor = await connection.execute(
+                """
+                SELECT cash, bank FROM players
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (user_id, chat_id),
+            )
+            updated = await cursor.fetchone()
+            if updated is None:
+                raise RuntimeError("Le joueur a disparu pendant le virement bancaire.")
+            return {
+                "status": "ok",
+                "amount": moved,
+                "cash": int(updated[0]),
+                "bank": int(updated[1]),
+            }
+
     async def settle_casino_bet(
         self,
         user_id: int,
         chat_id: int,
         stake: int,
         net_change: int,
+        xp_gain: int = 0,
     ) -> int | None:
         """Apply a wager's net balance change if its stake is affordable."""
         async with aiosqlite.connect(self.path) as connection:
             await connection.execute("BEGIN IMMEDIATE")
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                """
+                SELECT cash, xp FROM players
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (user_id, chat_id),
+            )
+            player = await cursor.fetchone()
+            if player is None or int(player["cash"]) < stake:
+                await connection.rollback()
+                return None
+            new_xp = int(player["xp"]) + max(0, xp_gain)
+            new_level = level_for_xp(new_xp)
             cursor = await connection.execute(
                 """
                 UPDATE players
-                SET cash = cash + ?
+                SET cash = cash + ?, xp = ?, level = ?
                 WHERE user_id = ? AND chat_id = ? AND cash >= ?
                 """,
-                (net_change, user_id, chat_id, stake),
+                (net_change, new_xp, new_level, user_id, chat_id, stake),
             )
             if cursor.rowcount != 1:
                 await connection.rollback()
@@ -467,6 +557,7 @@ class Database:
         cooldown_seconds: int,
         cash_delta: int,
         search_level_delta: int,
+        xp_gain: int = 0,
     ) -> tuple[str, int, int, int, int]:
         """Atomically apply a hustle, global cooldown, cash, and search level."""
         now = time.time()
@@ -479,7 +570,7 @@ class Database:
             connection.row_factory = aiosqlite.Row
             cursor = await connection.execute(
                 """
-                SELECT cash, heat, search_level, in_prison_until,
+                SELECT cash, heat, search_level, xp, in_prison_until,
                        last_hustle_time, last_hustle_cooldown
                 FROM players
                 WHERE user_id = ? AND chat_id = ?
@@ -529,10 +620,12 @@ class Database:
                 100,
                 max(0, int(player["heat"]) + search_level_delta),
             )
+            new_xp = int(player["xp"]) + max(0, xp_gain)
+            new_level = level_for_xp(new_xp)
             await connection.execute(
                 """
                 UPDATE players SET cash = cash + ?, heat = ?,
-                    search_level = ?, last_hustle_time = ?,
+                    search_level = ?, xp = ?, level = ?, last_hustle_time = ?,
                     last_hustle_cooldown = ?
                 WHERE user_id = ? AND chat_id = ?
                 """,
@@ -540,6 +633,8 @@ class Database:
                     actual_cash_delta,
                     new_heat,
                     new_search_level,
+                    new_xp,
+                    new_level,
                     now,
                     cooldown_seconds,
                     user_id,
@@ -571,6 +666,7 @@ class Database:
         cash_delta: int,
         heat_delta: int,
         prison_seconds: int = 0,
+        xp_gain: int = 0,
     ) -> dict[str, int | str]:
         """Atomically apply one fictional jugg result and its dedicated cooldown."""
         cooldown_seconds = min(30, max(15, int(cooldown_seconds)))
@@ -581,7 +677,7 @@ class Database:
             connection.row_factory = aiosqlite.Row
             cursor = await connection.execute(
                 """
-                SELECT cash, heat, search_level, in_prison_until,
+                SELECT cash, heat, search_level, xp, level, in_prison_until,
                        last_jugg_time, last_jugg_cooldown
                 FROM players
                 WHERE user_id = ? AND chat_id = ?
@@ -622,11 +718,13 @@ class Database:
                 100, max(0, int(player["search_level"]) + heat_delta)
             )
             new_prison_until = now + prison_seconds if prison_seconds else 0
+            new_xp = int(player["xp"]) + max(0, xp_gain)
+            new_level = level_for_xp(new_xp)
             await connection.execute(
                 """
                 UPDATE players
                 SET cash = ?, heat = ?, search_level = ?,
-                    in_prison_until = ?, last_jugg_time = ?,
+                    in_prison_until = ?, xp = ?, level = ?, last_jugg_time = ?,
                     last_jugg_cooldown = ?
                 WHERE user_id = ? AND chat_id = ?
                 """,
@@ -635,6 +733,8 @@ class Database:
                     new_heat,
                     new_search_level,
                     new_prison_until,
+                    new_xp,
+                    new_level,
                     now,
                     cooldown_seconds,
                     user_id,
@@ -649,6 +749,9 @@ class Database:
                 "heat_delta": new_heat - previous_heat,
                 "heat": new_heat,
                 "search_level": new_search_level,
+                "xp": new_xp,
+                "previous_level": int(player["level"]),
+                "level": new_level,
                 "prison_seconds": prison_seconds,
                 "cooldown_seconds": cooldown_seconds,
             }

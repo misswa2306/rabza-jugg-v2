@@ -25,6 +25,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.database.ensure_player(101, "rabza")
         player = await self.database.get_player(101)
         self.assertEqual(player["cash"], 500)
+        self.assertEqual(player["bank"], 0)
         self.assertEqual(player["balance"], 500)
         self.assertEqual(player["heat"], 0)
         self.assertEqual(player["search_level"], 0)
@@ -48,10 +49,11 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.database.ensure_player(-100123, "admin anonyme", -100123)
 
         result = await self.database.apply_hustle_result(
-            -100123, -100123, 20, 100, 1
+            -100123, -100123, 20, 100, 1, xp_gain=25
         )
         self.assertEqual(result, ("ok", 0, 600, 1, 100))
         player = await self.database.get_player(-100123, -100123)
+        self.assertEqual(player["xp"], 25)
         self.assertGreater(player["last_hustle_time"], 0)
         self.assertEqual(player["last_hustle_cooldown"], 20)
 
@@ -93,7 +95,9 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_jugg_result_is_atomic_and_uses_a_dedicated_cooldown(self) -> None:
         await self.database.ensure_player(102, "jugg")
 
-        result = await self.database.apply_jugg_result(102, 0, 15, 1200, 1)
+        result = await self.database.apply_jugg_result(
+            102, 0, 15, 1200, 1, xp_gain=100
+        )
 
         self.assertEqual(
             result,
@@ -104,6 +108,9 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 "heat_delta": 1,
                 "heat": 1,
                 "search_level": 1,
+                "xp": 100,
+                "previous_level": 1,
+                "level": 2,
                 "prison_seconds": 0,
                 "cooldown_seconds": 15,
             },
@@ -112,6 +119,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(player["last_jugg_time"], 0)
         self.assertEqual(player["last_jugg_cooldown"], 15)
         self.assertEqual(player["last_hustle_time"], 0)
+        self.assertEqual(player["xp"], 100)
+        self.assertEqual(player["level"], 2)
 
         blocked = await self.database.apply_jugg_result(102, 0, 30, 15000, 5)
         self.assertEqual(blocked["status"], "cooldown")
@@ -172,6 +181,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             {
                 "balance",
+                "bank",
                 "search_level",
                 "last_hustle_time",
                 "last_hustle_cooldown",
@@ -195,6 +205,49 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         player = await self.database.get_player(202)
         self.assertEqual(player["cash"], 200)
         self.assertEqual(player["in_prison_until"], 0)
+
+    async def test_bank_moves_all_and_amounts_atomically(self) -> None:
+        await self.database.ensure_player(215, "banker")
+
+        deposited = await self.database.move_bank_funds(215, 0, 200, True)
+        self.assertEqual(
+            deposited,
+            {"status": "ok", "amount": 200, "cash": 300, "bank": 200},
+        )
+        deposited_all = await self.database.move_bank_funds(215, 0, None, True)
+        self.assertEqual(
+            deposited_all,
+            {"status": "ok", "amount": 300, "cash": 0, "bank": 500},
+        )
+        withdrawn = await self.database.move_bank_funds(215, 0, None, False)
+        self.assertEqual(
+            withdrawn,
+            {"status": "ok", "amount": 500, "cash": 500, "bank": 0},
+        )
+
+        self.assertEqual(
+            (await self.database.move_bank_funds(215, 0, 0, True))["status"],
+            "invalid",
+        )
+        self.assertEqual(
+            (await self.database.move_bank_funds(215, 0, 501, True))["status"],
+            "insufficient",
+        )
+
+    async def test_bank_is_protected_from_fines_prison_and_pvp(self) -> None:
+        await self.database.ensure_player(216, "attaquant")
+        await self.database.ensure_player(217, "victime")
+        await self.database.move_bank_funds(216, 0, 300, True)
+        await self.database.move_bank_funds(217, 0, 300, True)
+
+        await self.database.apply_action_result(
+            216, 0, 0, None, None, xp_gain=19000
+        )
+        await self.database.apply_action_result(216, -200, 0, None, None)
+        self.assertEqual((await self.database.get_player(216))["bank"], 300)
+        await self.database.apply_pvp_result(216, 217, "success", 0, None, 70)
+        self.assertEqual((await self.database.get_player(216))["bank"], 300)
+        self.assertEqual((await self.database.get_player(217))["bank"], 300)
 
     async def test_escape_failure_extends_sentence_and_success_releases_player(self) -> None:
         await self.database.ensure_player(212, "escape")
@@ -742,12 +795,46 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         player = await migrated.get_player(707, 707)
         self.assertEqual(player["level"], 1)
         self.assertEqual(player["xp"], 0)
+        self.assertEqual(player["bank"], 0)
         self.assertEqual(player["last_jugg_time"], 0)
         self.assertEqual(player["last_jugg_cooldown"], 0)
         self.assertEqual(
             [item["item_id"] for item in await migrated.get_inventory(707, 707)],
             ["tech_fleece"],
         )
+
+    async def test_initialize_alters_existing_context_players_to_add_bank(self) -> None:
+        existing_path = Path(self.temp_dir.name) / "existing.sqlite3"
+        connection = sqlite3.connect(existing_path)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE players (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    cash INTEGER NOT NULL DEFAULT 500,
+                    heat INTEGER NOT NULL DEFAULT 0,
+                    in_prison_until REAL NOT NULL DEFAULT 0,
+                    gamos TEXT NOT NULL DEFAULT 'Aucun',
+                    level INTEGER NOT NULL DEFAULT 1,
+                    xp INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (chat_id, user_id)
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO players (chat_id, user_id, cash) VALUES (9, 707, 1200)"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = Database(str(existing_path))
+        await migrated.initialize()
+        player = await migrated.get_player(707, 9)
+        self.assertEqual(player["cash"], 1200)
+        self.assertEqual(player["bank"], 0)
 
 
 if __name__ == "__main__":
