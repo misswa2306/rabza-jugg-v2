@@ -502,18 +502,26 @@ class Database:
 
     async def ensure_player(
         self, user_id: int, username: str | None, chat_id: int = 0
-    ) -> None:
+    ) -> bool:
         async with aiosqlite.connect(self.path) as connection:
-            await connection.execute(
+            cursor = await connection.execute(
                 """
-                INSERT INTO players (chat_id, user_id, username)
+                INSERT OR IGNORE INTO players (chat_id, user_id, username)
                 VALUES (?, ?, ?)
-                ON CONFLICT(chat_id, user_id)
-                DO UPDATE SET username = excluded.username
                 """,
                 (chat_id, user_id, username),
             )
+            created = cursor.rowcount == 1
+            if not created:
+                await connection.execute(
+                    """
+                    UPDATE players SET username = ?
+                    WHERE user_id = ? AND chat_id = ?
+                    """,
+                    (username, user_id, chat_id),
+                )
             await connection.commit()
+            return created
 
     async def get_player(
         self, user_id: int, chat_id: int = 0

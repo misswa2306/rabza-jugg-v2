@@ -86,6 +86,71 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
             "HTML",
         )
 
+    async def test_start_existing_group_profile_is_preserved(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            database = Database(str(Path(temp_dir) / "start.sqlite3"))
+            await database.initialize()
+            await database.ensure_player(101, "joueur", -1001)
+            async with database.transaction() as connection:
+                await connection.execute(
+                    """
+                    UPDATE players
+                    SET cash = 321, bank = 654, level = 5, xp = 432
+                    WHERE user_id = ? AND chat_id = ?
+                    """,
+                    (101, -1001),
+                )
+            self.assertEqual(await database.purchase_item(101, "montreal_toque", -1001), "ok")
+
+            context = SimpleNamespace(
+                application=SimpleNamespace(bot_data={"database": database})
+            )
+            message = SimpleNamespace(
+                reply_text=AsyncMock(),
+                sender_chat=None,
+            )
+            update = SimpleNamespace(
+                effective_user=SimpleNamespace(
+                    id=101,
+                    username="joueur",
+                    full_name="Joueur",
+                    is_bot=False,
+                ),
+                effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
+                effective_message=message,
+            )
+
+            await start(update, context)
+
+            text = message.reply_text.await_args.args[0]
+            self.assertIn("déjà enregistré", text)
+            self.assertIn("/profil", text)
+            player = await database.get_player(101, -1001)
+            inventory = await database.get_inventory(101, -1001)
+            self.assertEqual(
+                (player["cash"], player["bank"], player["level"], player["xp"]),
+                (236, 654, 5, 432),
+            )
+            self.assertEqual(
+                [item["item_id"] for item in inventory], ["montreal_toque"]
+            )
+
+            other_group_message = SimpleNamespace(reply_text=AsyncMock())
+            other_group_update = SimpleNamespace(
+                effective_user=update.effective_user,
+                effective_chat=SimpleNamespace(id=-1002, type="supergroup"),
+                effective_message=other_group_message,
+            )
+            await start(other_group_update, context)
+            self.assertIn(
+                "Bienvenue",
+                other_group_message.reply_text.await_args.args[0],
+            )
+            new_group_player = await database.get_player(101, -1002)
+            self.assertEqual(new_group_player["cash"], 500)
+            self.assertEqual(new_group_player["bank"], 0)
+            self.assertEqual(await database.get_inventory(101, -1002), [])
+
     async def test_command_aliases_await_the_existing_handlers(self) -> None:
         update = SimpleNamespace()
         context = SimpleNamespace()
@@ -556,6 +621,9 @@ class ShopCallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("shop:101:brand:nike", brand_callbacks)
         self.assertIn("shop:101:brand:prada", brand_callbacks)
         self.assertIn("shop:101:home", brand_callbacks)
+        self.assertEqual(
+            sum(button.text == "⬅️ Retour" for button in brand_buttons), 1
+        )
 
         query.data = "shop:101:brand:nike"
         await shop_callback(update, context)
@@ -569,6 +637,9 @@ class ShopCallbackTests(unittest.IsolatedAsyncioTestCase):
         type_callbacks = [button.callback_data for button in type_buttons]
         self.assertIn("shop:101:type:nike:footwear", type_callbacks)
         self.assertIn("shop:101:section:sapes", type_callbacks)
+        self.assertEqual(
+            sum(button.text == "⬅️ Retour" for button in type_buttons), 1
+        )
 
         query.data = "shop:101:type:nike:footwear"
         await shop_callback(update, context)
@@ -584,6 +655,9 @@ class ShopCallbackTests(unittest.IsolatedAsyncioTestCase):
         item_callbacks = [button.callback_data for button in item_buttons]
         self.assertIn("buy:101:nike_air_max_tech", item_callbacks)
         self.assertIn("shop:101:brand:nike", item_callbacks)
+        self.assertEqual(
+            sum(button.text == "⬅️ Retour" for button in item_buttons), 1
+        )
 
         query.data = "buy:101:nike_air_max_tech"
         await shop_callback(update, context)
@@ -603,9 +677,14 @@ class ShopCallbackTests(unittest.IsolatedAsyncioTestCase):
             "shop:101:type:nike:footwear",
             [button.callback_data for button in buy_buttons],
         )
+        self.assertEqual(
+            sum(button.text == "⬅️ Retour" for button in buy_buttons), 1
+        )
 
     def test_expanded_fashion_catalog_has_unique_ids_and_preserves_game_rates(self) -> None:
-        from bot import SHOP_CLOTHING_CATEGORIES
+        from collections import Counter
+
+        from bot import SHOP_CLOTHING_CATEGORIES, shop_item_brand
         from game import ITEMS
 
         ids = [item.item_id for item in ITEMS]
@@ -613,8 +692,39 @@ class ShopCallbackTests(unittest.IsolatedAsyncioTestCase):
         fashion = [
             item for item in ITEMS if item.category in SHOP_CLOTHING_CATEGORIES
         ]
-        self.assertGreaterEqual(len(fashion), 75)
+        self.assertGreaterEqual(len(fashion), 250)
         self.assertTrue(all(item.xp_bonus >= 0 for item in fashion))
+        brand_counts = Counter(shop_item_brand(item)[0] for item in fashion)
+        for brand_id in (
+            "nike",
+            "prada",
+            "louis_vuitton",
+            "dior",
+            "gucci",
+            "balenciaga",
+            "lacoste",
+            "trapstar",
+            "corteiz",
+            "adidas",
+            "chanel",
+            "hermes",
+        ):
+            with self.subTest(brand=brand_id):
+                self.assertGreaterEqual(brand_counts[brand_id], 14)
+
+        category_counts = Counter(item.category for item in fashion)
+        for category, minimum in {
+            "vetements_accessoires": 48,
+            "vetement": 33,
+            "corps_vestes": 42,
+            "tete_visage": 33,
+            "pieds": 40,
+            "accessoires_sacoches": 48,
+            "accessoire": 19,
+            "luxe": 16,
+        }.items():
+            with self.subTest(category=category):
+                self.assertGreaterEqual(category_counts[category], minimum)
 
     async def test_clothing_category_shows_item_descriptions_and_buy_buttons(self) -> None:
         database = AsyncMock()

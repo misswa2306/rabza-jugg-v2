@@ -438,9 +438,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(new_item_ids <= {item.item_id for item in clothing_items})
         self.assertTrue(all(item.description for item in clothing_items))
         self.assertEqual(len({item.item_id for item in ITEMS}), len(ITEMS))
-        self.assertEqual(
-            {item.item_id for item in luxury_items},
-            new_item_ids - {
+        legacy_luxury_ids = new_item_ids - {
                 "stealth_style_balaclava",
                 "carhartt_paintball_beanie",
                 "gold_ny_cap",
@@ -463,7 +461,13 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 "adidas_slides_socks",
                 "winter_boots_montreal",
                 "retro_basketball_sneakers",
-            },
+            }
+        luxury_item_ids = {item.item_id for item in luxury_items}
+        self.assertTrue(legacy_luxury_ids <= luxury_item_ids)
+        self.assertIn("hermes_premium_watch", luxury_item_ids)
+        self.assertTrue(
+            {"nike_stadium_tee", "prada_crossbody_bag"}
+            <= {item.item_id for item in clothing_items}
         )
         self.assertTrue(all(item.description for item in luxury_items))
         self.assertEqual(SHOP_CATEGORIES["tete_visage"], "Vêtements & Accessoires — Tête & Visage")
@@ -494,6 +498,14 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             inventory_by_id["adidas_slides_socks"]["category"], "pieds"
         )
         self.assertIn("tuque", inventory_by_id["montreal_toque"]["description"].casefold())
+
+        await self.database.ensure_player(408, "expanded-fashion")
+        self.assertEqual(
+            await self.database.purchase_item(408, "nike_stadium_tee"), "ok"
+        )
+        expanded_inventory = await self.database.get_inventory(408)
+        self.assertEqual(expanded_inventory[0]["item_id"], "nike_stadium_tee")
+        self.assertIn("activités d’arcade", expanded_inventory[0]["description"])
 
     async def test_luxury_shop_item_is_seeded_and_purchased_atomically(self) -> None:
         await self.database.ensure_player(407, "luxury")

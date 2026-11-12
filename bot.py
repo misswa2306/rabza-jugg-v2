@@ -315,10 +315,21 @@ async def post_init(application: Application) -> None:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    actor = await player_context(update, context)
+    actor = await player_context(update, context, ensure_player=False)
     if actor is None:
         return
-    actor_info, _chat, message = actor
+    actor_info, chat, message = actor
+    created = await database_for(context).ensure_player(
+        actor_info["id"], actor_info["username"], chat.id
+    )
+    if not created:
+        await message.reply_text(
+            f"👋 T'es déjà enregistré dans le quartier, "
+            f"<b>{escape(actor_info['name'])}</b>, reuf.\n"
+            "Tape /profil pour voir tes bails.",
+            parse_mode="HTML",
+        )
+        return
     await message.reply_text(
         f"🎮 Bienvenue dans les rues de Montréal, <b>{escape(actor_info['name'])}</b>!\n"
         "Ici, tu montes ta kichta, tu fais évoluer ta collection de gamos et "
@@ -967,7 +978,6 @@ async def show_shop_items(
         for item in category_items
     ]
     keyboard.append(shop_back_button(actor_info["id"], back_payload))
-    keyboard.append(shop_back_button(actor_info["id"], "home"))
     item_details = "\n\n".join(
         f"• {item.name} — {item.price}$ (niveau {item.min_level})\n"
         f"{item.description or 'Article de collection avec effets réservés à l’arcade.'}\n"
@@ -1024,10 +1034,7 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             query,
             text,
             reply_markup=InlineKeyboardMarkup(
-                [
-                    shop_back_button(user_id, shop_item_route(item)),
-                    shop_back_button(user_id, "home"),
-                ]
+                [shop_back_button(user_id, shop_item_route(item))]
             ),
         )
         return

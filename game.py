@@ -1269,6 +1269,54 @@ def vehicle_rental_quote(item: ShopItem, duration: str) -> tuple[int, int]:
     return item.price * rent_percent // 100, item.price * deposit_percent // 100
 
 
+_FASHION_BRANDS = (
+    ("nike", "Nike", 420, 1),
+    ("prada", "Prada", 1700, 15),
+    ("louis_vuitton", "Louis Vuitton", 2100, 18),
+    ("dior", "Dior", 1900, 17),
+    ("gucci", "Gucci", 1650, 15),
+    ("balenciaga", "Balenciaga", 1600, 15),
+    ("lacoste", "Lacoste", 460, 3),
+    ("trapstar", "Trapstar", 520, 4),
+    ("corteiz", "Corteiz", 500, 4),
+    ("adidas", "Adidas", 390, 1),
+    ("chanel", "Chanel", 2600, 22),
+    ("hermes", "Hermès", 2800, 24),
+)
+_FASHION_STYLES = (
+    ("stadium_tee", "T-shirt Stadium", "vetements_accessoires", 1.0),
+    ("logo_tee", "T-shirt Signature", "vetements_accessoires", 1.2),
+    ("straight_pants", "Pantalon droit", "vetement", 1.35),
+    ("cargo_pants", "Pantalon cargo", "vetement", 1.55),
+    ("logo_hoodie", "Hoodie logo", "corps_vestes", 2.0),
+    ("light_jacket", "Veste légère", "corps_vestes", 2.6),
+    ("embroidered_cap", "Casquette brodée", "tete_visage", 0.8),
+    ("ribbed_beanie", "Bonnet côtelé", "tete_visage", 0.9),
+    ("city_runner", "Sneakers City Runner", "pieds", 1.8),
+    ("court_sneaker", "Sneakers Court", "pieds", 2.1),
+    ("crossbody_bag", "Sacoche crossbody", "accessoires_sacoches", 1.5),
+    ("leather_bag", "Sac de collection", "accessoires_sacoches", 2.3),
+    ("signature_jewelry", "Bijou Signature", "accessoire", 1.3),
+    ("premium_watch", "Montre de collection", "luxe", 3.2),
+)
+ITEMS += tuple(
+    ShopItem(
+        f"{brand_id}_{style_id}",
+        f"{brand_name} — {style_name}",
+        category,
+        (int(base_price * multiplier) // 10) * 10,
+        min(45, max(base_level, int(base_price * multiplier // 600))),
+        xp_bonus=min(35, max(2, int(base_price * multiplier // 200))),
+        success_bonus=min(0.05, 0.01 + base_price * multiplier / 200_000),
+        description=(
+            "Pièce de collection pour compléter ton style; "
+            "bonus appliqués aux activités d’arcade."
+        ),
+    )
+    for brand_id, brand_name, base_price, base_level in _FASHION_BRANDS
+    for style_id, style_name, category, multiplier in _FASHION_STYLES
+)
+
 SHOP_CATEGORIES = {
     "vetements_accessoires": "Vêtements & Accessoires",
     "tete_visage": "Vêtements & Accessoires — Tête & Visage",
