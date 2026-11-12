@@ -21,6 +21,10 @@ python bot.py
 `.env.example` documente les variables requises, mais n'est pas chargé
 automatiquement. Définis `BOT_TOKEN` dans l'environnement avant de démarrer.
 Ne partage pas le fichier `.env` ni le token.
+Les commandes admin sont réservées aux deux ID Telegram intégrés dans
+`config.py`. Pour remplacer cette liste, définis `ADMIN_USER_IDS` avec des ID
+numériques séparés par des virgules; `ADMIN_USER_ID` est aussi accepté pour un
+seul administrateur. Les ID ne doivent pas être des usernames.
 
 Le fichier SQLite `rabza_jugg_bot.sqlite3` est créé automatiquement au premier
 lancement, dans le dossier du projet. Un chemin relatif donné par
@@ -91,6 +95,35 @@ Ne publie jamais le token dans le code ou dans un dépôt.
 - `/jugg` — ouvrir les activités d’arcade et leurs paliers
 - `/juggling` — alias de `/jugg`
 - `/casino` — ouvrir les jeux et consulter leur syntaxe
+- `/admin` — ouvrir le panneau de contrôle réservé aux administrateurs
+- `/devmode` — basculer entre Mode Joueur et Mode Développeur
+- `/give_cash [@username] [montant|max] [cash|bank]` — ajouter le montant exact ou, sans montant, porter le compte au plafond
+- `/give_xp [@username] [montant|max]` — ajouter l'XP exacte ou, sans montant, la porter au plafond
+- `/set_level [@username] [niveau]` — fixer le niveau exact ou, sans niveau, atteindre le maximum
+- `/give_item [@username] [id_item|nom|all]` — donner un article ou, sans item/avec `all`, tout le catalogue
+- `/give_infinite [@username] [montant] [cash|bank]` — créditer un joueur du groupe; 1 milliard par défaut
+- `/admin_reset [@username] [repair|full CONFIRMER]` — réparer ou réinitialiser un profil du groupe
+
+`/devmode` et les boutons de `/admin` basculent un état persistant par ID admin.
+En Mode Joueur, toutes les commandes de crédit, progression, attribution et
+réparation admin sont verrouillées. En Mode Développeur, les actions admin du
+panneau sont disponibles; `max` porte le cash ou la banque à 1 000 000 000 000$.
+Sans montant, `/give_cash` porte également le compte sélectionné à ce plafond.
+L'XP sans montant est portée à 999 999 999 999 XP; un niveau fixé sans argument
+est réglé au niveau maximum. `/give_item` sans argument ou avec `all` ajoute une
+référence du catalogue à l'inventaire sans dupliquer les entrées déjà possédées.
+L'admin ignore les cooldowns de hustle, jugg, conduite et duel, peut agir malgré
+une peine, ne peut pas être envoyé en prison par les missions/PVP et bénéficie
+de réparations gratuites (les réparations de location déjà dues sont faites
+automatiquement avant un trajet). Les règles standard s'appliquent aux autres
+joueurs ciblés. Le badge `[DEV]` n'apparaît que dans le `/profil` de l'admin
+concerné.
+
+Les commandes admin vérifient l'ID Telegram configuré. `/admin_reset repair`
+préserve l'économie, le niveau, l'XP et l'inventaire; le mode `full` exige
+`CONFIRMER` et remet à zéro le profil ainsi que son inventaire dans la
+conversation visée. Un crédit ou une réinitialisation ne touche jamais le même
+joueur dans les autres groupes.
 
 Le menu `/jugg` inclut les paliers fictifs Petit Hustle de Bloc (jusqu'à
 1 200$), Gros Business Centre-Ville (4 500$) et Opération Internationale /

@@ -15,9 +15,16 @@ from bot import (
     braquer,
     bank,
     casino,
+    admin,
+    admin_callback,
+    admin_reset,
     deposit,
+    devmode,
     drive,
     edit_callback_message,
+    give_cash,
+    give_item,
+    give_xp,
     help_command,
     handle_game_action,
     player_context,
@@ -27,6 +34,7 @@ from bot import (
     casino_command,
     profil,
     give_command,
+    give_infinite,
     handle_jugg_tier,
     handle_bank_callback,
     main as bot_main,
@@ -40,13 +48,14 @@ from bot import (
     prison_remaining_seconds,
     shop,
     shop_callback,
+    set_level,
     shoot,
     vehicle_rental_callback,
     start,
     withdraw,
 )
-from config import validate_config
-from database import Database
+from config import ADMIN_USER_IDS, validate_config
+from database import MAX_ADMIN_XP, Database
 
 
 class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -205,6 +214,14 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
             "/evade",
             "/inventory",
             "/top",
+            "/admin",
+            "/devmode",
+            "/give_cash",
+            "/give_xp",
+            "/set_level",
+            "/give_item",
+            "/give_infinite",
+            "/admin_reset",
         ):
             with self.subTest(command=command):
                 self.assertIn(command, text)
@@ -236,6 +253,14 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
                 "mission_vapote",
                 "mission_depanneur",
                 "mission_sneakers",
+                "admin",
+                "devmode",
+                "give_cash",
+                "give_xp",
+                "set_level",
+                "give_item",
+                "give_infinite",
+                "admin_reset",
                 "help",
                 "jugg",
                 "juggling",
@@ -310,8 +335,8 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         for command in (
             "bank", "deposit", "withdraw", "hustle", "drive", "ride", "repair",
-            "return",
-            "shoot",
+            "return", "shoot", "admin", "give_infinite", "admin_reset",
+            "devmode", "give_cash", "give_xp", "set_level", "give_item",
         ):
             self.assertTrue(
                 any(
@@ -331,6 +356,13 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
             any(
                 isinstance(handler, CallbackQueryHandler)
                 and handler.pattern.pattern == r"^jugg:"
+                for handler in handlers
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(handler, CallbackQueryHandler)
+                and handler.pattern.pattern == r"^admin:"
                 for handler in handlers
             )
         )
@@ -476,6 +508,489 @@ class GiveCommandTests(unittest.IsolatedAsyncioTestCase):
             "❌ Tu ne peux pas t'envoyer du cash à toi-même."
         )
         database.transfer_cash.assert_not_awaited()
+
+
+class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
+    ADMIN_ID = 8970668955
+    GROUP_ID = -1009001
+
+    def _context(
+        self, database: Database | AsyncMock, args: list[str]
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database}),
+            args=args,
+        )
+
+    def _update(
+        self,
+        user_id: int,
+        message: SimpleNamespace,
+        chat_id: int = GROUP_ID,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=user_id,
+                username="admin" if user_id == self.ADMIN_ID else "player",
+                full_name="Admin" if user_id == self.ADMIN_ID else "Player",
+                is_bot=False,
+            ),
+            effective_chat=SimpleNamespace(id=chat_id, type="supergroup"),
+            effective_message=message,
+        )
+
+    async def test_non_admin_is_denied_from_all_admin_commands(self) -> None:
+        database = AsyncMock()
+        message = SimpleNamespace(
+            reply_text=AsyncMock(),
+            reply_to_message=None,
+        )
+        update = self._update(101, message)
+        context = self._context(database, [])
+
+        with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+            await admin(update, context)
+            await give_infinite(update, context)
+            await admin_reset(update, context)
+            await give_cash(update, context)
+            await give_xp(update, context)
+            await set_level(update, context)
+            await give_item(update, context)
+
+        self.assertEqual(message.reply_text.await_count, 7)
+        self.assertTrue(
+            all(
+                "Passe ton chemin" in call.args[0]
+                for call in message.reply_text.await_args_list
+            )
+        )
+        database.admin_credit_player.assert_not_awaited()
+        database.admin_reset_player.assert_not_awaited()
+
+    async def test_admin_panel_is_owner_bound_and_has_control_buttons(self) -> None:
+        database = AsyncMock()
+        database.get_admin_dev_mode.return_value = False
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = self._update(self.ADMIN_ID, message)
+        context = self._context(database, [])
+
+        with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+            await admin(update, context)
+
+        markup = message.reply_text.await_args.kwargs["reply_markup"]
+        callbacks = [
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+        ]
+        self.assertEqual(
+            callbacks,
+            [f"admin:{self.ADMIN_ID}:toggle"],
+        )
+
+        query = AsyncMock(data=f"admin:{self.ADMIN_ID}:credit")
+        unauthorized_update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(
+                id=101, is_bot=False, username="player", full_name="Player"
+            ),
+        )
+        with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+            await admin_callback(unauthorized_update, context)
+        query.answer.assert_awaited_once()
+        self.assertTrue(query.answer.await_args.kwargs["show_alert"])
+        query.edit_message_text.assert_not_awaited()
+
+    async def test_admin_panel_exposes_all_controls_only_in_developer_mode(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            database = Database(str(Path(temp_dir) / "admin_panel.sqlite3"))
+            await database.initialize()
+            await database.toggle_admin_dev_mode(self.ADMIN_ID)
+            context = self._context(database, [])
+            message = SimpleNamespace(reply_text=AsyncMock())
+            update = self._update(self.ADMIN_ID, message)
+
+            with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+                await admin(update, context)
+
+            keyboard = message.reply_text.await_args.kwargs["reply_markup"].inline_keyboard
+            actions = {
+                button.callback_data.rsplit(":", 1)[-1]
+                for row in keyboard
+                for button in row
+            }
+            self.assertEqual(
+                actions,
+                {"toggle", "credit", "xp", "level", "item", "repair", "reset"},
+            )
+            for action, command in (
+                ("credit", "/give_cash"),
+                ("xp", "/give_xp"),
+                ("level", "/set_level"),
+                ("item", "/give_item"),
+                ("repair", "/admin_reset"),
+                ("reset", "/admin_reset"),
+            ):
+                with self.subTest(action=action):
+                    query = AsyncMock(data=f"admin:{self.ADMIN_ID}:{action}")
+                    callback_update = SimpleNamespace(
+                        callback_query=query,
+                        effective_user=update.effective_user,
+                    )
+                    with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+                        await admin_callback(callback_update, context)
+                    self.assertIn(command, query.edit_message_text.await_args.args[0])
+
+    async def test_dev_tools_credit_cash_xp_level_and_items_for_self_and_player(self) -> None:
+        from game import ITEMS
+
+        with TemporaryDirectory() as temp_dir:
+            database = Database(str(Path(temp_dir) / "admin_tools.sqlite3"))
+            await database.initialize()
+            await database.ensure_player(self.ADMIN_ID, "admin", self.GROUP_ID)
+            await database.ensure_player(204, "recipient", self.GROUP_ID)
+            await database.ensure_player(204, "recipient", self.GROUP_ID - 1)
+            await database.toggle_admin_dev_mode(self.ADMIN_ID)
+            context = self._context(database, ["2500", "bank"])
+            message = SimpleNamespace(
+                reply_text=AsyncMock(),
+                reply_to_message=None,
+            )
+            update = self._update(self.ADMIN_ID, message)
+
+            with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+                await give_cash(update, context)
+                context.args = []
+                await give_cash(update, context)
+                context.args = ["@recipient", "100000", "bank"]
+                await give_cash(update, context)
+                self.assertEqual(
+                    (await database.get_player(204, self.GROUP_ID))["bank"],
+                    100_000,
+                )
+                context.args = ["@recipient"]
+                await give_cash(update, context)
+                context.args = ["@recipient", "20000"]
+                await give_xp(update, context)
+                self.assertEqual(
+                    (await database.get_player(204, self.GROUP_ID))["xp"],
+                    20_000,
+                )
+                context.args = ["@recipient"]
+                await give_xp(update, context)
+                context.args = []
+                await give_xp(update, context)
+                context.args = ["@recipient", "25"]
+                await set_level(update, context)
+                self.assertEqual(
+                    (await database.get_player(204, self.GROUP_ID))["level"],
+                    25,
+                )
+                context.args = ["@recipient"]
+                await set_level(update, context)
+                context.args = ["@recipient", "bixi"]
+                await give_item(update, context)
+                context.args = ["@recipient", "audi"]
+                await give_item(update, context)
+                context.args = ["@recipient", "Audi", "RS", "6", "Avant"]
+                await give_item(update, context)
+                context.args = ["@recipient"]
+                await give_item(update, context)
+
+            admin_player = await database.get_player(self.ADMIN_ID, self.GROUP_ID)
+            recipient = await database.get_player(204, self.GROUP_ID)
+            other_group_recipient = await database.get_player(204, self.GROUP_ID - 1)
+            inventory = await database.get_inventory(204, self.GROUP_ID)
+            self.assertEqual(
+                (admin_player["cash"], admin_player["bank"]),
+                (1_000_000_000_000, 2500),
+            )
+            self.assertEqual(
+                (admin_player["xp"], admin_player["level"]),
+                (MAX_ADMIN_XP, 60),
+            )
+            self.assertEqual(recipient["cash"], 1_000_000_000_000)
+            self.assertEqual((recipient["xp"], recipient["level"]), (177_000, 60))
+            self.assertEqual(recipient["bank"], 100_000)
+            self.assertEqual((other_group_recipient["cash"], other_group_recipient["xp"]), (500, 0))
+            self.assertEqual(len(inventory), len(ITEMS))
+            self.assertIn("bixi", {item["item_id"] for item in inventory})
+            self.assertIn("audi_rs3_nardo", {item["item_id"] for item in inventory})
+            self.assertIn("audi_rs6_avant", {item["item_id"] for item in inventory})
+            self.assertEqual(message.reply_text.await_count, 13)
+
+    async def test_god_mode_ignores_existing_prison_on_mission_and_player_mode_does_not(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            database = Database(str(Path(temp_dir) / "admin_god_mode.sqlite3"))
+            await database.initialize()
+            await database.ensure_player(self.ADMIN_ID, "admin", self.GROUP_ID)
+            async with database.transaction() as connection:
+                await connection.execute(
+                    """
+                    UPDATE players SET in_prison_until = ?
+                    WHERE user_id = ? AND chat_id = ?
+                    """,
+                    (datetime.now(timezone.utc).timestamp() + 300, self.ADMIN_ID, self.GROUP_ID),
+                )
+            context = self._context(database, ["civic"])
+            message = SimpleNamespace(reply_text=AsyncMock())
+            update = self._update(self.ADMIN_ID, message)
+
+            with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+                await missions(update, context)
+            self.assertIn("taule", message.reply_text.await_args.args[0])
+
+            await database.toggle_admin_dev_mode(self.ADMIN_ID)
+            message.reply_text.reset_mock()
+            with (
+                patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})),
+                patch("bot.random.random", return_value=0.0),
+            ):
+                await missions(update, context)
+
+            self.assertIn("Mission réussie", message.reply_text.await_args.args[0])
+            player = await database.get_player(self.ADMIN_ID, self.GROUP_ID)
+            self.assertEqual(player["in_prison_until"], 0)
+
+    async def test_devmode_command_and_button_toggle_persist_and_mark_profile(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            database = Database(str(Path(temp_dir) / "admin_mode.sqlite3"))
+            await database.initialize()
+            await database.ensure_player(self.ADMIN_ID, "admin", self.GROUP_ID)
+            self.assertEqual(
+                await database.purchase_item(
+                    self.ADMIN_ID, "montreal_toque", self.GROUP_ID
+                ),
+                "ok",
+            )
+            async with database.transaction() as connection:
+                await connection.execute(
+                    """
+                    UPDATE players SET bank = 321, xp = 444, level = 4
+                    WHERE user_id = ? AND chat_id = ?
+                    """,
+                    (self.ADMIN_ID, self.GROUP_ID),
+                )
+            player_before = await database.get_player(self.ADMIN_ID, self.GROUP_ID)
+            inventory_before = await database.get_inventory(
+                self.ADMIN_ID, self.GROUP_ID
+            )
+            context = self._context(database, [])
+            message = SimpleNamespace(
+                reply_text=AsyncMock(),
+                sender_chat=None,
+                reply_to_message=None,
+            )
+            update = self._update(self.ADMIN_ID, message)
+
+            with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+                await profil(update, context)
+            self.assertNotIn(
+                "[DEV]", message.reply_text.await_args.args[0]
+            )
+
+            message.reply_text.reset_mock()
+            with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+                await devmode(update, context)
+            self.assertTrue(await database.get_admin_dev_mode(self.ADMIN_ID))
+            self.assertIn("Mode Développeur", message.reply_text.await_args.args[0])
+
+            message.reply_text.reset_mock()
+            with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+                await profil(update, context)
+            self.assertIn("[DEV]", message.reply_text.await_args.args[0])
+
+            query = AsyncMock(data=f"admin:{self.ADMIN_ID}:toggle")
+            callback_update = SimpleNamespace(
+                callback_query=query,
+                effective_user=update.effective_user,
+            )
+            with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+                await admin_callback(callback_update, context)
+            self.assertFalse(await database.get_admin_dev_mode(self.ADMIN_ID))
+            self.assertIn(
+                "Mode Joueur", query.edit_message_text.await_args.args[0]
+            )
+            player_after = await database.get_player(self.ADMIN_ID, self.GROUP_ID)
+            self.assertEqual(
+                (
+                    player_after["cash"],
+                    player_after["bank"],
+                    player_after["xp"],
+                    player_after["level"],
+                ),
+                (
+                    player_before["cash"],
+                    player_before["bank"],
+                    player_before["xp"],
+                    player_before["level"],
+                ),
+            )
+            self.assertEqual(
+                await database.get_inventory(self.ADMIN_ID, self.GROUP_ID),
+                inventory_before,
+            )
+            blocked_action = AsyncMock(data=f"admin:{self.ADMIN_ID}:xp")
+            blocked_callback_update = SimpleNamespace(
+                callback_query=blocked_action,
+                effective_user=update.effective_user,
+            )
+            with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+                await admin_callback(blocked_callback_update, context)
+                context.args = ["100"]
+                await give_xp(update, context)
+            self.assertTrue(blocked_action.answer.await_args.kwargs["show_alert"])
+            self.assertIn(
+                "verrouillé en Mode Joueur",
+                message.reply_text.await_args.args[0],
+            )
+            unchanged_admin = await database.get_player(
+                self.ADMIN_ID, self.GROUP_ID
+            )
+            self.assertEqual(unchanged_admin["xp"], player_before["xp"])
+
+    async def test_cheat_commands_are_locked_while_admin_is_in_player_mode(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            database = Database(str(Path(temp_dir) / "admin_lock.sqlite3"))
+            await database.initialize()
+            await database.ensure_player(204, "recipient", self.GROUP_ID)
+            context = self._context(
+                database, ["@recipient", "100000"]
+            )
+            message = SimpleNamespace(
+                reply_text=AsyncMock(),
+                reply_to_message=None,
+            )
+            update = self._update(self.ADMIN_ID, message)
+
+            with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+                await give_infinite(update, context)
+                await admin_reset(update, context)
+                await give_cash(update, context)
+                await give_xp(update, context)
+                await set_level(update, context)
+                await give_item(update, context)
+
+            self.assertEqual(message.reply_text.await_count, 6)
+            self.assertTrue(
+                all(
+                    "verrouillé en Mode Joueur" in call.args[0]
+                    for call in message.reply_text.await_args_list
+                )
+            )
+            player = await database.get_player(204, self.GROUP_ID)
+            self.assertEqual((player["cash"], player["bank"]), (500, 0))
+
+    async def test_admin_credit_by_username_targets_only_current_chat(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            database = Database(str(Path(temp_dir) / "admin.sqlite3"))
+            await database.initialize()
+            await database.ensure_player(202, "recipient", self.GROUP_ID)
+            await database.ensure_player(202, "recipient", self.GROUP_ID - 1)
+            await database.toggle_admin_dev_mode(self.ADMIN_ID)
+            message = SimpleNamespace(
+                reply_text=AsyncMock(),
+                reply_to_message=None,
+            )
+            update = self._update(self.ADMIN_ID, message)
+            context = self._context(database, ["@recipient", "100000", "bank"])
+
+            with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+                await give_infinite(update, context)
+
+            player = await database.get_player(202, self.GROUP_ID)
+            other_group_player = await database.get_player(202, self.GROUP_ID - 1)
+            self.assertEqual((player["cash"], player["bank"]), (500, 100000))
+            self.assertEqual(
+                (other_group_player["cash"], other_group_player["bank"]),
+                (500, 0),
+            )
+            self.assertIn("Crédit admin appliqué", message.reply_text.await_args.args[0])
+
+    async def test_admin_credit_can_target_a_replied_message(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            database = Database(str(Path(temp_dir) / "admin_reply.sqlite3"))
+            await database.initialize()
+            await database.ensure_player(204, "reply_target", self.GROUP_ID)
+            await database.toggle_admin_dev_mode(self.ADMIN_ID)
+            replied_message = SimpleNamespace(
+                from_user=SimpleNamespace(
+                    id=204,
+                    username="reply_target",
+                    full_name="Reply Target",
+                    is_bot=False,
+                )
+            )
+            message = SimpleNamespace(
+                reply_text=AsyncMock(),
+                reply_to_message=replied_message,
+            )
+            update = self._update(self.ADMIN_ID, message)
+            context = self._context(database, ["250"])
+
+            with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+                await give_infinite(update, context)
+
+            player = await database.get_player(204, self.GROUP_ID)
+            self.assertEqual(player["cash"], 750)
+            self.assertIn("250$", message.reply_text.await_args.args[0])
+
+    async def test_full_reset_requires_confirmation_and_is_group_scoped(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            database = Database(str(Path(temp_dir) / "admin_reset.sqlite3"))
+            await database.initialize()
+            await database.toggle_admin_dev_mode(self.ADMIN_ID)
+            for chat_id in (self.GROUP_ID, self.GROUP_ID - 1):
+                await database.ensure_player(303, "reset_target", chat_id)
+                async with database.transaction() as connection:
+                    await connection.execute(
+                        """
+                        UPDATE players
+                        SET cash = 1000, bank = 500, level = 5, xp = 1000
+                        WHERE user_id = ? AND chat_id = ?
+                        """,
+                        (303, chat_id),
+                    )
+                self.assertEqual(
+                    await database.purchase_item(303, "montreal_toque", chat_id),
+                    "ok",
+                )
+
+            context = self._context(
+                database, ["@reset_target", "full"]
+            )
+            message = SimpleNamespace(
+                reply_text=AsyncMock(),
+                reply_to_message=None,
+            )
+            update = self._update(self.ADMIN_ID, message)
+            with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+                await admin_reset(update, context)
+            self.assertIn("confirmer", message.reply_text.await_args.args[0])
+            still_unchanged = await database.get_player(303, self.GROUP_ID)
+            self.assertEqual(
+                (still_unchanged["cash"], still_unchanged["bank"]),
+                (915, 500),
+            )
+
+            message.reply_text.reset_mock()
+            context.args = ["@reset_target", "full", "CONFIRMER"]
+            with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+                await admin_reset(update, context)
+
+            reset_player = await database.get_player(303, self.GROUP_ID)
+            other_group_player = await database.get_player(303, self.GROUP_ID - 1)
+            self.assertEqual(
+                (reset_player["cash"], reset_player["bank"],
+                 reset_player["level"], reset_player["xp"]),
+                (500, 0, 1, 0),
+            )
+            self.assertEqual(
+                (other_group_player["cash"], other_group_player["bank"],
+                 other_group_player["level"], other_group_player["xp"]),
+                (915, 500, 5, 1000),
+            )
+            self.assertEqual(await database.get_inventory(303, self.GROUP_ID), [])
 
 
 class ShopCallbackTests(unittest.IsolatedAsyncioTestCase):
@@ -1790,7 +2305,8 @@ class JuggCallbackTests(unittest.IsolatedAsyncioTestCase):
             await handle_jugg_tier(update, context)
 
         database.apply_jugg_result.assert_awaited_once_with(
-            101, -1001, 15, 1200, 1, 0, 30
+            101, -1001, 15, 1200, 1, 0, 30,
+            bypass_cooldown=False, god_mode=False
         )
         text = query.edit_message_text.await_args.args[0]
         self.assertIn("Cash: +1200$ | Solde: 1700$", text)
@@ -1869,7 +2385,8 @@ class JuggCallbackTests(unittest.IsolatedAsyncioTestCase):
             -100303, "Groupe Montréal", -100303
         )
         database.apply_action_result.assert_awaited_once_with(
-            -100303, 90, 8, None, None, 30, chat_id=-100303
+            -100303, 90, 8, None, None, 30,
+            chat_id=-100303, god_mode=False
         )
 
     async def test_callback_passes_equipment_bonus_to_random_resolver(self) -> None:
@@ -1909,12 +2426,16 @@ class JuggCallbackTests(unittest.IsolatedAsyncioTestCase):
         query.answer.assert_awaited_once()
         database.get_item_effects.assert_awaited_once_with(303, -100303)
         database.apply_action_result.assert_awaited_once_with(
-            303, 90, 8, None, None, 30, chat_id=-100303
+            303, 90, 8, None, None, 30,
+            chat_id=-100303, god_mode=False
         )
         self.assertIn("réussi", query.edit_message_text.await_args.args[0])
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_only_configured_admin_ids_are_allowed_by_default(self) -> None:
+        self.assertEqual(ADMIN_USER_IDS, frozenset({8970668955, 8742788260}))
+
     def test_missing_botfather_token_fails_with_clear_configuration_error(self) -> None:
         with patch("config.BOT_TOKEN", ""):
             with self.assertRaisesRegex(

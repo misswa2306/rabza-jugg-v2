@@ -8,11 +8,20 @@ from typing import Any, AsyncIterator
 
 import aiosqlite
 
-from game import ITEMS, VEHICLE_RENTAL_TERMS, level_for_xp, vehicle_rental_quote
+from game import (
+    ITEMS,
+    MAX_LEVEL,
+    VEHICLE_RENTAL_TERMS,
+    level_for_xp,
+    vehicle_rental_quote,
+)
 
 
 MIN_HUSTLE_COOLDOWN_SECONDS = 15
 MAX_HUSTLE_COOLDOWN_SECONDS = 30
+MAX_ADMIN_BALANCE = 1_000_000_000_000
+MAX_ADMIN_XP = 999_999_999_999
+MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
 
 def _reward_xp(xp_gain: int, cash_delta: int) -> int:
@@ -43,7 +52,13 @@ def _epoch_timestamp(value: object) -> float | None:
 
 class Database:
     def __init__(self, path: str) -> None:
-        self.path = path
+        if path == ":memory:":
+            self.path = path
+            return
+        database_path = Path(path).expanduser()
+        if not database_path.is_absolute():
+            database_path = Path(__file__).resolve().parent / database_path
+        self.path = str(database_path.resolve())
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
@@ -118,7 +133,7 @@ class Database:
                     tables.add(players_backup_table)
                 await connection.execute(
                     """
-                    CREATE TABLE players (
+                    CREATE TABLE IF NOT EXISTS players (
                         chat_id INTEGER NOT NULL,
                         user_id INTEGER NOT NULL,
                         username TEXT,
@@ -143,7 +158,7 @@ class Database:
             if "players" not in tables:
                 await connection.execute(
                     """
-                    CREATE TABLE players (
+                    CREATE TABLE IF NOT EXISTS players (
                         chat_id INTEGER NOT NULL,
                         user_id INTEGER NOT NULL,
                         username TEXT,
@@ -418,6 +433,15 @@ class Database:
                     PRIMARY KEY (chat_id, user_id),
                     FOREIGN KEY (chat_id, user_id)
                         REFERENCES players(chat_id, user_id) ON DELETE CASCADE
+                )
+                """
+            )
+            await connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS admin_modes (
+                    admin_user_id INTEGER PRIMARY KEY,
+                    dev_mode INTEGER NOT NULL DEFAULT 0
+                        CHECK (dev_mode IN (0, 1))
                 )
                 """
             )
@@ -706,10 +730,13 @@ class Database:
         prison_until: datetime | float | None,
         xp_gain: int = 0,
         chat_id: int = 0,
+        god_mode: bool = False,
     ) -> bool:
         """Apply a game result atomically, unless the player is already jailed."""
         now = time.time()
-        new_prison_until = _epoch_timestamp(prison_until) or 0
+        new_prison_until = (
+            0 if god_mode else _epoch_timestamp(prison_until) or 0
+        )
         async with aiosqlite.connect(self.path) as connection:
             await connection.execute("BEGIN IMMEDIATE")
             connection.row_factory = aiosqlite.Row
@@ -727,7 +754,11 @@ class Database:
 
             until_value = row["in_prison_until"]
             current_end_time = _epoch_timestamp(until_value)
-            if current_end_time is not None and current_end_time > now:
+            if (
+                not god_mode
+                and current_end_time is not None
+                and current_end_time > now
+            ):
                 await connection.rollback()
                 return False
             new_xp = row["xp"] + _reward_xp(xp_gain, cash_delta)
@@ -767,6 +798,8 @@ class Database:
         cash_delta: int,
         search_level_delta: int,
         xp_gain: int = 0,
+        bypass_cooldown: bool = False,
+        god_mode: bool = False,
     ) -> tuple[str, int, int, int, int]:
         """Atomically apply a hustle, global cooldown, cash, and search level."""
         now = time.time()
@@ -792,7 +825,7 @@ class Database:
                 return "missing", 0, 0, 0, 0
 
             prison_until = _epoch_timestamp(player["in_prison_until"])
-            if prison_until is not None and prison_until > now:
+            if not god_mode and prison_until is not None and prison_until > now:
                 await connection.rollback()
                 return (
                     "prison",
@@ -808,7 +841,7 @@ class Database:
                 int(player["last_hustle_cooldown"] or 0),
             )
             remaining = previous_cooldown - (now - last_hustle_time)
-            if last_hustle_time > 0 and remaining > 0:
+            if not bypass_cooldown and last_hustle_time > 0 and remaining > 0:
                 await connection.rollback()
                 return (
                     "cooldown",
@@ -876,6 +909,8 @@ class Database:
         heat_delta: int,
         prison_seconds: int = 0,
         xp_gain: int = 0,
+        bypass_cooldown: bool = False,
+        god_mode: bool = False,
     ) -> dict[str, int | str]:
         """Atomically apply one fictional jugg result and its dedicated cooldown."""
         cooldown_seconds = min(30, max(15, int(cooldown_seconds)))
@@ -899,7 +934,7 @@ class Database:
                 return {"status": "missing"}
 
             prison_until = _epoch_timestamp(player["in_prison_until"])
-            if prison_until is not None and prison_until > now:
+            if not god_mode and prison_until is not None and prison_until > now:
                 await connection.rollback()
                 return {
                     "status": "prison",
@@ -911,7 +946,7 @@ class Database:
                 30, int(player["last_jugg_cooldown"] or 0)
             )
             remaining = previous_cooldown - (now - last_jugg_time)
-            if last_jugg_time > 0 and remaining > 0:
+            if not bypass_cooldown and last_jugg_time > 0 and remaining > 0:
                 await connection.rollback()
                 return {
                     "status": "cooldown",
@@ -926,7 +961,10 @@ class Database:
             new_search_level = min(
                 100, max(0, int(player["search_level"]) + heat_delta)
             )
-            new_prison_until = now + prison_seconds if prison_seconds else 0
+            applied_prison_seconds = 0 if god_mode else prison_seconds
+            new_prison_until = (
+                now + applied_prison_seconds if applied_prison_seconds else 0
+            )
             new_xp = int(player["xp"]) + _reward_xp(xp_gain, cash_delta)
             new_level = level_for_xp(new_xp)
             await connection.execute(
@@ -962,7 +1000,7 @@ class Database:
                 "xp_gain": _reward_xp(xp_gain, cash_delta),
                 "previous_level": int(player["level"]),
                 "level": new_level,
-                "prison_seconds": prison_seconds,
+                "prison_seconds": applied_prison_seconds,
                 "cooldown_seconds": cooldown_seconds,
             }
 
@@ -1009,7 +1047,7 @@ class Database:
         return bool(await self.get_owned_vehicles(user_id, chat_id))
 
     async def repair_vehicle_rental(
-        self, user_id: int, chat_id: int = 0
+        self, user_id: int, chat_id: int = 0, free: bool = False
     ) -> dict[str, Any]:
         """Charge outstanding rental repair costs before the vehicle is reused."""
         now = time.time()
@@ -1034,15 +1072,16 @@ class Database:
             due = int(rental["repair_due"])
             if due <= 0:
                 return {"status": "clean", "name": rental["name"]}
-            if int(rental["cash"]) < due:
+            if not free and int(rental["cash"]) < due:
                 return {"status": "funds", "fee": due}
-            await connection.execute(
-                """
-                UPDATE players SET cash = cash - ?
-                WHERE user_id = ? AND chat_id = ? AND cash >= ?
-                """,
-                (due, user_id, chat_id, due),
-            )
+            if not free:
+                await connection.execute(
+                    """
+                    UPDATE players SET cash = cash - ?
+                    WHERE user_id = ? AND chat_id = ? AND cash >= ?
+                    """,
+                    (due, user_id, chat_id, due),
+                )
             await connection.execute(
                 """
                 UPDATE vehicle_rentals
@@ -1051,7 +1090,12 @@ class Database:
                 """,
                 (rental["rental_id"], user_id, chat_id),
             )
-            return {"status": "ok", "name": rental["name"], "fee": due}
+            return {
+                "status": "ok",
+                "name": rental["name"],
+                "fee": 0 if free else due,
+                "waived_fee": due if free else 0,
+            }
 
     async def complete_vehicle_drive(
         self,
@@ -1061,6 +1105,8 @@ class Database:
         severity_roll: float,
         maintenance_roll: float,
         cooldown_seconds: int = 60,
+        bypass_cooldown: bool = False,
+        god_mode: bool = False,
     ) -> dict[str, Any]:
         """Resolve a city drive, its rewards, upkeep, rental risk, and cooldown."""
         if not all(
@@ -1088,7 +1134,7 @@ class Database:
             if player is None:
                 return {"status": "missing"}
             prison_until = _epoch_timestamp(player["in_prison_until"])
-            if prison_until is not None and prison_until > now:
+            if not god_mode and prison_until is not None and prison_until > now:
                 return {"status": "prison", "remaining": int(prison_until - now) + 1}
             rental_cursor = await connection.execute(
                 """
@@ -1111,11 +1157,20 @@ class Database:
             if rental is not None:
                 vehicle_name = str(rental["name"])
                 if int(rental["repair_due"]) > 0:
-                    return {
-                        "status": "repair_required",
-                        "name": vehicle_name,
-                        "fee": int(rental["repair_due"]),
-                    }
+                    if not god_mode:
+                        return {
+                            "status": "repair_required",
+                            "name": vehicle_name,
+                            "fee": int(rental["repair_due"]),
+                        }
+                    await connection.execute(
+                        """
+                        UPDATE vehicle_rentals
+                        SET repair_due = 0, damage_state = 'intact'
+                        WHERE rental_id = ? AND user_id = ? AND chat_id = ? AND active = 1
+                        """,
+                        (rental["rental_id"], user_id, chat_id),
+                    )
             else:
                 cursor = await connection.execute(
                     """
@@ -1135,7 +1190,7 @@ class Database:
                 vehicle_name = str(owned["name"])
 
             last_drive_at = player["last_drive_at"]
-            if last_drive_at is not None:
+            if not bypass_cooldown and last_drive_at is not None:
                 remaining = cooldown_seconds - (now - float(last_drive_at))
                 if remaining > 0:
                     return {"status": "cooldown", "remaining": int(remaining) + 1}
@@ -1212,7 +1267,7 @@ class Database:
                         "deposit_remaining": remainder,
                         "is_rental": 1,
                     }
-            elif not is_rental and maintenance_roll < 0.02:
+            elif not god_mode and not is_rental and maintenance_roll < 0.02:
                 maintenance_fee = min(15, int(player["cash"]))
                 await connection.execute(
                     """
@@ -1444,6 +1499,7 @@ class Database:
         chat_id: int,
         incident_roll: float,
         severity_roll: float,
+        free_repair: bool = False,
     ) -> dict[str, Any]:
         """Apply one arcade trip's rental risk without affecting player progression."""
         now = time.time()
@@ -1467,11 +1523,20 @@ class Database:
                 )
                 return {"status": "expired", "name": rental["name"], **refund}
             if int(rental["repair_due"]) > 0:
-                return {
-                    "status": "repair_required",
-                    "name": rental["name"],
-                    "fee": int(rental["repair_due"]),
-                }
+                if not free_repair:
+                    return {
+                        "status": "repair_required",
+                        "name": rental["name"],
+                        "fee": int(rental["repair_due"]),
+                    }
+                await connection.execute(
+                    """
+                    UPDATE vehicle_rentals
+                    SET repair_due = 0, damage_state = 'intact'
+                    WHERE rental_id = ? AND user_id = ? AND chat_id = ? AND active = 1
+                    """,
+                    (rental["rental_id"], user_id, chat_id),
+                )
             if incident_roll >= 0.25:
                 return {"status": "clear", "name": rental["name"]}
 
@@ -1670,7 +1735,8 @@ class Database:
             connection.row_factory = aiosqlite.Row
             cursor = await connection.execute(
                 """
-                SELECT user_id, username, cash, heat, in_prison_until, gamos, level, xp
+                SELECT user_id, username, cash, bank, heat, in_prison_until,
+                       gamos, level, xp
                 FROM players
                 WHERE username = ? COLLATE NOCASE AND chat_id = ?
                 """,
@@ -1678,6 +1744,293 @@ class Database:
             )
             row = await cursor.fetchone()
             return dict(row) if row is not None else None
+
+    async def get_admin_dev_mode(self, admin_user_id: int) -> bool:
+        async with aiosqlite.connect(self.path) as connection:
+            cursor = await connection.execute(
+                "SELECT dev_mode FROM admin_modes WHERE admin_user_id = ?",
+                (admin_user_id,),
+            )
+            row = await cursor.fetchone()
+            return bool(row[0]) if row is not None else False
+
+    async def toggle_admin_dev_mode(self, admin_user_id: int) -> bool:
+        async with self.transaction() as connection:
+            cursor = await connection.execute(
+                "SELECT dev_mode FROM admin_modes WHERE admin_user_id = ?",
+                (admin_user_id,),
+            )
+            row = await cursor.fetchone()
+            new_mode = not bool(row[0]) if row is not None else True
+            await connection.execute(
+                """
+                INSERT INTO admin_modes (admin_user_id, dev_mode)
+                VALUES (?, ?)
+                ON CONFLICT(admin_user_id)
+                DO UPDATE SET dev_mode = excluded.dev_mode
+                """,
+                (admin_user_id, int(new_mode)),
+            )
+            return new_mode
+
+    async def admin_credit_player(
+        self, user_id: int, chat_id: int, amount: int | None, account: str = "cash"
+    ) -> dict[str, int | str]:
+        """Credit one account without allowing overflow or crossing chat scope."""
+        if (amount is not None and amount <= 0) or account not in {"cash", "bank"}:
+            return {"status": "invalid"}
+
+        async with self.transaction() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT cash, bank FROM players
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (user_id, chat_id),
+            )
+            player = await cursor.fetchone()
+            if player is None:
+                return {"status": "missing"}
+
+            current = int(player[0] if account == "cash" else player[1])
+            if amount is None:
+                amount = max(0, MAX_ADMIN_BALANCE - current)
+                if amount == 0:
+                    return {"status": "limit"}
+            if amount > 9_223_372_036_854_775_807 - current:
+                return {"status": "limit"}
+
+            await connection.execute(
+                f"""
+                UPDATE players SET {account} = {account} + ?
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (amount, user_id, chat_id),
+            )
+            cursor = await connection.execute(
+                """
+                SELECT cash, bank FROM players
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (user_id, chat_id),
+            )
+            updated = await cursor.fetchone()
+            if updated is None:
+                raise RuntimeError("Profil introuvable après le crédit administrateur.")
+            return {"status": "ok", "cash": int(updated[0]), "bank": int(updated[1])}
+
+    async def admin_give_xp(
+        self, user_id: int, chat_id: int, amount: int | None
+    ) -> dict[str, int | str]:
+        if amount is not None and amount <= 0:
+            return {"status": "invalid"}
+        async with self.transaction() as connection:
+            cursor = await connection.execute(
+                "SELECT xp FROM players WHERE user_id = ? AND chat_id = ?",
+                (user_id, chat_id),
+            )
+            player = await cursor.fetchone()
+            if player is None:
+                return {"status": "missing"}
+            current_xp = int(player[0])
+            if amount is None:
+                amount = max(0, MAX_ADMIN_XP - current_xp)
+                if amount == 0:
+                    return {"status": "limit"}
+            if amount > MAX_SQLITE_INTEGER - current_xp:
+                return {"status": "limit"}
+            new_xp = current_xp + amount
+            new_level = level_for_xp(new_xp)
+            await connection.execute(
+                """
+                UPDATE players SET xp = ?, level = ?
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (new_xp, new_level, user_id, chat_id),
+            )
+            return {
+                "status": "ok",
+                "xp": new_xp,
+                "xp_added": amount,
+                "level": new_level,
+            }
+
+    async def admin_set_level(
+        self, user_id: int, chat_id: int, level: int
+    ) -> dict[str, int | str]:
+        if not 1 <= level <= MAX_LEVEL:
+            return {"status": "invalid"}
+        xp = 50 * level * (level - 1)
+        async with self.transaction() as connection:
+            cursor = await connection.execute(
+                "SELECT 1 FROM players WHERE user_id = ? AND chat_id = ?",
+                (user_id, chat_id),
+            )
+            if await cursor.fetchone() is None:
+                return {"status": "missing"}
+            await connection.execute(
+                """
+                UPDATE players SET xp = ?, level = ?
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (xp, level, user_id, chat_id),
+            )
+            return {"status": "ok", "xp": xp, "level": level}
+
+    async def admin_give_item(
+        self, user_id: int, chat_id: int, item_id: str | None
+    ) -> dict[str, int | str]:
+        async with self.transaction() as connection:
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                "SELECT 1 FROM players WHERE user_id = ? AND chat_id = ?",
+                (user_id, chat_id),
+            )
+            if await cursor.fetchone() is None:
+                return {"status": "missing"}
+
+            if item_id is None or item_id.casefold() == "all":
+                cursor = await connection.execute(
+                    "SELECT item_id FROM items ORDER BY item_id"
+                )
+                all_items = await cursor.fetchall()
+                if not all_items:
+                    return {"status": "invalid_item"}
+                await connection.execute(
+                    """
+                    INSERT OR IGNORE INTO inventory
+                        (chat_id, user_id, item_id, quantity)
+                    SELECT ?, ?, item_id, 1 FROM items
+                    """,
+                    (chat_id, user_id),
+                )
+                return {
+                    "status": "ok",
+                    "item_id": "all",
+                    "name": "Catalogue complet",
+                    "count": len(all_items),
+                }
+
+            cursor = await connection.execute(
+                """
+                SELECT item_id, name, category
+                FROM items ORDER BY min_level, price, item_id
+                """
+            )
+            items = await cursor.fetchall()
+            normalized_item_id = item_id.strip().casefold()
+            item = next(
+                (
+                    candidate
+                    for candidate in items
+                    if str(candidate["item_id"]).casefold() == normalized_item_id
+                ),
+                None,
+            )
+            if item is None:
+                item = next(
+                    (
+                        candidate
+                        for candidate in items
+                        if str(candidate["name"]).casefold() == normalized_item_id
+                    ),
+                    None,
+                )
+            if item is None:
+                item = next(
+                    (
+                        candidate
+                        for candidate in items
+                        if normalized_item_id
+                        in str(candidate["item_id"]).casefold()
+                        or normalized_item_id in str(candidate["name"]).casefold()
+                    ),
+                    None,
+                )
+            if item is None:
+                return {"status": "invalid_item"}
+            await connection.execute(
+                """
+                INSERT INTO inventory (chat_id, user_id, item_id, quantity)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(chat_id, user_id, item_id)
+                DO UPDATE SET quantity = quantity + 1
+                """,
+                (chat_id, user_id, str(item["item_id"])),
+            )
+            return {
+                "status": "ok",
+                "item_id": str(item["item_id"]),
+                "name": str(item["name"]),
+                "category": str(item["category"]),
+            }
+
+    async def admin_repair_player(
+        self, user_id: int, chat_id: int
+    ) -> str:
+        """Repair transient state while preserving economy, progression and items."""
+        async with self.transaction() as connection:
+            cursor = await connection.execute(
+                """
+                UPDATE players
+                SET heat = 0, search_level = 0, in_prison_until = 0,
+                    last_hustle_time = 0, last_hustle_cooldown = 0,
+                    last_jugg_time = 0, last_jugg_cooldown = 0
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (user_id, chat_id),
+            )
+            if cursor.rowcount == 0:
+                return "missing"
+            await connection.execute(
+                "DELETE FROM shoot_cooldowns WHERE user_id = ? AND chat_id = ?",
+                (user_id, chat_id),
+            )
+            await connection.execute(
+                "DELETE FROM drive_cooldowns WHERE user_id = ? AND chat_id = ?",
+                (user_id, chat_id),
+            )
+            return "ok"
+
+    async def admin_reset_player(self, user_id: int, chat_id: int) -> str:
+        """Reset a single group profile and its inventory, preserving other chats."""
+        async with self.transaction() as connection:
+            cursor = await connection.execute(
+                """
+                UPDATE players
+                SET cash = 500, bank = 0, heat = 0, in_prison_until = 0,
+                    gamos = 'Aucun', level = 1, xp = 0, search_level = 0,
+                    last_hustle_time = 0, last_hustle_cooldown = 0,
+                    last_jugg_time = 0, last_jugg_cooldown = 0
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (user_id, chat_id),
+            )
+            if cursor.rowcount == 0:
+                return "missing"
+            await connection.execute(
+                "DELETE FROM inventory WHERE user_id = ? AND chat_id = ?",
+                (user_id, chat_id),
+            )
+            await connection.execute(
+                """
+                UPDATE vehicle_rentals
+                SET active = 0, ended_at = ?, end_reason = 'admin_reset',
+                    deposit_cash_remaining = 0, deposit_bank_remaining = 0,
+                    damage_state = 'intact', repair_due = 0
+                WHERE user_id = ? AND chat_id = ? AND active = 1
+                """,
+                (time.time(), user_id, chat_id),
+            )
+            await connection.execute(
+                "DELETE FROM shoot_cooldowns WHERE user_id = ? AND chat_id = ?",
+                (user_id, chat_id),
+            )
+            await connection.execute(
+                "DELETE FROM drive_cooldowns WHERE user_id = ? AND chat_id = ?",
+                (user_id, chat_id),
+            )
+            return "ok"
 
     async def transfer_cash(
         self, sender_id: int, recipient_id: int, amount: int, chat_id: int = 0
@@ -1758,6 +2111,7 @@ class Database:
         xp_gain: int,
         transfer_rate: float = 0.20,
         chat_id: int = 0,
+        god_mode: bool = False,
     ) -> dict[str, int | str] | None:
         """Apply an abstract PVP result and cash transfer atomically."""
         if attacker_id == victim_id:
@@ -1785,7 +2139,7 @@ class Database:
             if attacker["level"] < 20:
                 await connection.rollback()
                 return {"status": "level"}
-            if attacker["in_prison_until"]:
+            if not god_mode and attacker["in_prison_until"]:
                 until = _epoch_timestamp(attacker["in_prison_until"])
                 if until is not None and until > now:
                     await connection.rollback()
@@ -1799,7 +2153,12 @@ class Database:
                     SET cash = cash - ?, in_prison_until = ?
                     WHERE user_id = ? AND chat_id = ?
                     """,
-                    (actual_fine, new_prison_until, attacker_id, chat_id),
+                    (
+                        actual_fine,
+                        0 if god_mode else new_prison_until,
+                        attacker_id,
+                        chat_id,
+                    ),
                 )
                 await connection.execute(
                     """
@@ -1812,7 +2171,7 @@ class Database:
                 return {"status": "counter", "fine": actual_fine}
 
             if outcome != "success":
-                if outcome == "failed" and new_prison_until:
+                if outcome == "failed" and new_prison_until and not god_mode:
                     await connection.execute(
                         """
                         UPDATE players SET in_prison_until = ?
@@ -1861,6 +2220,8 @@ class Database:
         prison_until: datetime | float | None,
         chat_id: int = 0,
         cooldown_seconds: int = 60,
+        bypass_cooldown: bool = False,
+        god_mode: bool = False,
     ) -> dict[str, int | str] | None:
         """Apply one group-scoped arcade duel, its loot, and target cooldown."""
         if (
@@ -1894,12 +2255,14 @@ class Database:
                 (chat_id, attacker_id, victim_id),
             )
             cooldown = await cursor.fetchone()
-            if cooldown is not None:
+            if not bypass_cooldown and cooldown is not None:
                 remaining = cooldown_seconds - (now - float(cooldown["last_shot_at"]))
                 if remaining > 0:
                     return {"status": "cooldown", "remaining": int(remaining) + 1}
 
             for player_id in (attacker_id, victim_id):
+                if god_mode and player_id == attacker_id:
+                    continue
                 until = _epoch_timestamp(players[player_id]["in_prison_until"])
                 if until is not None and until > now:
                     return {
@@ -1936,7 +2299,9 @@ class Database:
                 """,
                 (
                     cash_loss,
-                    prison_deadline if police_intervention else 0,
+                    prison_deadline
+                    if police_intervention and not (god_mode and loser_id == attacker_id)
+                    else 0,
                     chat_id,
                     loser_id,
                 ),
@@ -1961,7 +2326,9 @@ class Database:
                 "police_intervention": int(police_intervention),
                 "prison_seconds": (
                     max(0, int(prison_deadline - now))
-                    if police_intervention and prison_deadline
+                    if police_intervention
+                    and prison_deadline
+                    and not (god_mode and loser_id == attacker_id)
                     else 0
                 ),
             }

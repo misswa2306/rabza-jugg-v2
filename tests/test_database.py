@@ -8,7 +8,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from database import Database
+from database import MAX_ADMIN_BALANCE, MAX_ADMIN_XP, Database
 from game import ITEMS, PRISON_DURATION_SECONDS, SHOP_CATEGORIES
 
 
@@ -44,6 +44,35 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(player["heat"], 12)
         self.assertEqual(player["search_level"], 12)
         self.assertEqual(player["gamos"], "RAV4")
+
+    async def test_initialize_restart_preserves_player_data_and_inventory(self) -> None:
+        await self.database.ensure_player(102, "persistent", -1002)
+        async with self.database.transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE players
+                SET cash = 1234, bank = 5678, level = 12, xp = 7654
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (102, -1002),
+            )
+        self.assertEqual(
+            await self.database.purchase_item(102, "montreal_toque", -1002),
+            "ok",
+        )
+
+        restarted_database = Database(self.database.path)
+        await restarted_database.initialize()
+
+        player = await restarted_database.get_player(102, -1002)
+        inventory = await restarted_database.get_inventory(102, -1002)
+        self.assertEqual(
+            (player["cash"], player["bank"], player["level"], player["xp"]),
+            (1149, 5678, 12, 7654),
+        )
+        self.assertEqual(
+            [item["item_id"] for item in inventory], ["montreal_toque"]
+        )
 
     async def test_hustle_cooldown_is_atomic_and_global_to_the_player(self) -> None:
         await self.database.ensure_player(-100123, "admin anonyme", -100123)
@@ -81,10 +110,396 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(jugg["xp_gain"], 1)
         player = await self.database.get_player(104)
         self.assertEqual(player["xp"], 3)
-
         await self.database.settle_casino_bet(104, 0, 1, 1)
         player = await self.database.get_player(104)
         self.assertEqual(player["xp"], 4)
+
+    async def test_admin_credit_is_atomic_and_scoped_by_chat(self) -> None:
+        await self.database.ensure_player(220, "admin_target", -100220)
+        await self.database.ensure_player(220, "admin_target", -100221)
+
+        result = await self.database.admin_credit_player(
+            220, -100220, 100_000, "bank"
+        )
+
+        self.assertEqual(
+            result,
+            {"status": "ok", "cash": 500, "bank": 100_000},
+        )
+        first = await self.database.get_player(220, -100220)
+        second = await self.database.get_player(220, -100221)
+        self.assertEqual((first["cash"], first["bank"]), (500, 100_000))
+        self.assertEqual((second["cash"], second["bank"]), (500, 0))
+        self.assertEqual(
+            await self.database.admin_credit_player(220, -100220, 0, "cash"),
+            {"status": "invalid"},
+        )
+        self.assertEqual(
+            await self.database.admin_credit_player(
+                999, -100220, 100, "cash"
+            ),
+            {"status": "missing"},
+        )
+
+    async def test_admin_cash_xp_level_and_items_are_group_scoped(self) -> None:
+        user_id, chat_id = 224, -100224
+        await self.database.ensure_player(user_id, "admin_tools", chat_id)
+        await self.database.ensure_player(user_id, "admin_tools", chat_id - 1)
+
+        max_credit = await self.database.admin_credit_player(
+            user_id, chat_id, None, "cash"
+        )
+        self.assertEqual(max_credit["status"], "ok")
+        self.assertEqual(max_credit["cash"], MAX_ADMIN_BALANCE)
+        xp_result = await self.database.admin_give_xp(user_id, chat_id, 20_000)
+        self.assertEqual(
+            (xp_result["status"], xp_result["xp"], xp_result["level"]),
+            ("ok", 20_000, 20),
+        )
+        level_result = await self.database.admin_set_level(user_id, chat_id, 10)
+        self.assertEqual(
+            (level_result["status"], level_result["xp"], level_result["level"]),
+            ("ok", 4_500, 10),
+        )
+        item_result = await self.database.admin_give_item(
+            user_id, chat_id, "bixi"
+        )
+        self.assertEqual(
+            (item_result["status"], item_result["category"]),
+            ("ok", "vehicules"),
+        )
+        self.assertEqual(
+            await self.database.admin_give_item(user_id, chat_id, "unknown_item"),
+            {"status": "invalid_item"},
+        )
+
+        player = await self.database.get_player(user_id, chat_id)
+        other_group_player = await self.database.get_player(user_id, chat_id - 1)
+        inventory = await self.database.get_inventory(user_id, chat_id)
+        self.assertEqual(
+            (player["cash"], player["xp"], player["level"]),
+            (MAX_ADMIN_BALANCE, 4_500, 10),
+        )
+        self.assertEqual(
+            (other_group_player["cash"], other_group_player["xp"],
+             other_group_player["level"]),
+            (500, 0, 1),
+        )
+        self.assertEqual(
+            [(item["item_id"], item["category"]) for item in inventory],
+            [("bixi", "vehicules")],
+        )
+
+    async def test_admin_optional_xp_and_item_arguments_fill_catalog_caps(self) -> None:
+        user_id, chat_id = 227, -100227
+        await self.database.ensure_player(user_id, "catalog_admin", chat_id)
+
+        xp_result = await self.database.admin_give_xp(user_id, chat_id, None)
+        self.assertEqual(
+            (xp_result["status"], xp_result["xp"], xp_result["level"]),
+            ("ok", MAX_ADMIN_XP, 60),
+        )
+        audi = await self.database.admin_give_item(user_id, chat_id, "audi")
+        self.assertEqual(
+            (audi["status"], audi["item_id"], audi["category"]),
+            ("ok", "audi_rs3_nardo", "vehicules"),
+        )
+        all_items = await self.database.admin_give_item(user_id, chat_id, None)
+        repeated_all = await self.database.admin_give_item(
+            user_id, chat_id, "all"
+        )
+        inventory = await self.database.get_inventory(user_id, chat_id)
+        self.assertEqual(all_items["count"], len(ITEMS))
+        self.assertEqual(repeated_all["count"], len(ITEMS))
+        self.assertEqual(len(inventory), len(ITEMS))
+
+    async def test_dev_mode_ignores_prison_and_waives_rental_repairs(self) -> None:
+        user_id, chat_id = 225, -100225
+        victim_id = 226
+        await self.database.ensure_player(user_id, "dev_admin", chat_id)
+        await self.database.ensure_player(victim_id, "target", chat_id)
+        await self.database.purchase_item(user_id, "bixi", chat_id)
+        async with self.database.transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE players SET in_prison_until = ?
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (time.time() + 300, user_id, chat_id),
+            )
+
+        blocked_drive = await self.database.complete_vehicle_drive(
+            user_id, chat_id, 0.99, 0.5, 0.01
+        )
+        blocked_hustle = await self.database.apply_hustle_result(
+            user_id, chat_id, 20, 10, 0
+        )
+        dev_hustle = await self.database.apply_hustle_result(
+            user_id, chat_id, 20, 10, 0, bypass_cooldown=True, god_mode=True
+        )
+        dev_jugg = await self.database.apply_jugg_result(
+            user_id,
+            chat_id,
+            15,
+            0,
+            0,
+            prison_seconds=20,
+            bypass_cooldown=True,
+            god_mode=True,
+        )
+        dev_drive = await self.database.complete_vehicle_drive(
+            user_id, chat_id, 0.99, 0.5, 0.01, god_mode=True
+        )
+        self.assertEqual(blocked_drive["status"], "prison")
+        self.assertEqual(blocked_hustle[0], "prison")
+        self.assertEqual(dev_hustle[0], "ok")
+        self.assertEqual(dev_jugg["prison_seconds"], 0)
+        self.assertEqual(dev_drive["status"], "clear")
+        self.assertEqual(dev_drive["maintenance_fee"], 0)
+
+        failed_action = await self.database.apply_action_result(
+            user_id, 0, 0, None, time.time() + 300, chat_id=chat_id,
+            god_mode=True,
+        )
+        self.assertTrue(failed_action)
+        player = await self.database.get_player(user_id, chat_id)
+        self.assertEqual(player["in_prison_until"], 0)
+
+        async with self.database.transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE players SET level = 20, xp = 19000, in_prison_until = ?
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (time.time() + 300, user_id, chat_id),
+            )
+        pvp = await self.database.apply_pvp_result(
+            user_id,
+            victim_id,
+            "counter",
+            20,
+            time.time() + 45,
+            0,
+            chat_id=chat_id,
+            god_mode=True,
+        )
+        self.assertEqual(pvp["status"], "counter")
+        player = await self.database.get_player(user_id, chat_id)
+        self.assertEqual(player["in_prison_until"], 0)
+
+        async with self.database.transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE players SET in_prison_until = ?
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (time.time() + 300, user_id, chat_id),
+            )
+        shootout = await self.database.apply_shootout_result(
+            user_id,
+            victim_id,
+            victim_id,
+            125,
+            True,
+            time.time() + 45,
+            chat_id=chat_id,
+            bypass_cooldown=True,
+            god_mode=True,
+        )
+        self.assertEqual(shootout["status"], "ok")
+        self.assertEqual(shootout["prison_seconds"], 0)
+        player = await self.database.get_player(user_id, chat_id)
+        self.assertEqual(player["in_prison_until"], 0)
+
+        await self.database.create_vehicle_rental(user_id, chat_id, "bixi", "1h")
+        damage = await self.database.apply_vehicle_trip(
+            user_id, chat_id, 0.1, 0.2
+        )
+        self.assertEqual(damage["status"], "light")
+        cash_before_repair = (await self.database.get_player(user_id, chat_id))["cash"]
+        repair = await self.database.repair_vehicle_rental(
+            user_id, chat_id, free=True
+        )
+        self.assertEqual((repair["status"], repair["fee"]), ("ok", 0))
+        repaired_player = await self.database.get_player(user_id, chat_id)
+        self.assertEqual(repaired_player["cash"], cash_before_repair)
+        self.assertEqual((await self.database.get_vehicle_rental(
+            user_id, chat_id
+        ))["repair_due"], 0)
+
+    async def test_admin_repair_preserves_economy_progression_and_inventory(self) -> None:
+        await self.database.ensure_player(221, "repair_target", -100221)
+        async with self.database.transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE players
+                SET cash = 900, bank = 800, level = 7, xp = 600,
+                    heat = 80, search_level = 60,
+                    in_prison_until = 9999999999,
+                    last_hustle_time = 10, last_hustle_cooldown = 30,
+                    last_jugg_time = 20, last_jugg_cooldown = 15
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (221, -100221),
+            )
+        self.assertEqual(
+            await self.database.purchase_item(221, "montreal_toque", -100221),
+            "ok",
+        )
+
+        self.assertEqual(
+            await self.database.admin_repair_player(221, -100221), "ok"
+        )
+
+        player = await self.database.get_player(221, -100221)
+        self.assertEqual(
+            (player["cash"], player["bank"], player["level"], player["xp"]),
+            (815, 800, 7, 600),
+        )
+        self.assertEqual(
+            (player["heat"], player["search_level"], player["in_prison_until"]),
+            (0, 0, 0),
+        )
+        self.assertEqual(
+            [item["item_id"] for item in await self.database.get_inventory(
+                221, -100221
+            )],
+            ["montreal_toque"],
+        )
+
+    async def test_admin_full_reset_only_resets_target_chat(self) -> None:
+        await self.database.ensure_player(222, "reset_target", -100222)
+        await self.database.ensure_player(222, "reset_target", -100223)
+        for chat_id in (-100222, -100223):
+            async with self.database.transaction() as connection:
+                await connection.execute(
+                    """
+                    UPDATE players SET cash = 900, bank = 800, level = 7, xp = 600
+                    WHERE user_id = ? AND chat_id = ?
+                    """,
+                    (222, chat_id),
+                )
+            self.assertEqual(
+                await self.database.purchase_item(222, "montreal_toque", chat_id),
+                "ok",
+            )
+
+        self.assertEqual(
+            await self.database.admin_reset_player(222, -100222), "ok"
+        )
+        reset_player = await self.database.get_player(222, -100222)
+        other_player = await self.database.get_player(222, -100223)
+        self.assertEqual(
+            (reset_player["cash"], reset_player["bank"], reset_player["level"],
+             reset_player["xp"]),
+            (500, 0, 1, 0),
+        )
+        self.assertEqual(
+            (other_player["cash"], other_player["bank"], other_player["level"],
+             other_player["xp"]),
+            (815, 800, 7, 600),
+        )
+        self.assertEqual(await self.database.get_inventory(222, -100222), [])
+        self.assertEqual(
+            [item["item_id"] for item in await self.database.get_inventory(
+                222, -100223
+            )],
+            ["montreal_toque"],
+        )
+
+    async def test_admin_dev_mode_defaults_off_and_persists_per_admin(self) -> None:
+        self.assertFalse(await self.database.get_admin_dev_mode(8970668955))
+        self.assertTrue(await self.database.toggle_admin_dev_mode(8970668955))
+        self.assertTrue(await self.database.get_admin_dev_mode(8970668955))
+        self.assertFalse(await self.database.get_admin_dev_mode(8742788260))
+
+        restarted = Database(self.database.path)
+        await restarted.initialize()
+        self.assertTrue(await restarted.get_admin_dev_mode(8970668955))
+        self.assertFalse(await restarted.toggle_admin_dev_mode(8970668955))
+        self.assertFalse(await restarted.get_admin_dev_mode(8970668955))
+
+    async def test_dev_mode_bypasses_only_active_gameplay_cooldowns(self) -> None:
+        user_id, chat_id = 230, -100230
+        await self.database.ensure_player(user_id, "dev_test", chat_id)
+
+        first_hustle = await self.database.apply_hustle_result(
+            user_id, chat_id, 20, 10, 0
+        )
+        blocked_hustle = await self.database.apply_hustle_result(
+            user_id, chat_id, 20, 10, 0
+        )
+        bypassed_hustle = await self.database.apply_hustle_result(
+            user_id, chat_id, 20, 10, 0, bypass_cooldown=True
+        )
+        self.assertEqual(first_hustle[0], "ok")
+        self.assertEqual(blocked_hustle[0], "cooldown")
+        self.assertEqual(bypassed_hustle[0], "ok")
+
+        first_jugg = await self.database.apply_jugg_result(
+            user_id, chat_id, 15, 10, 0
+        )
+        blocked_jugg = await self.database.apply_jugg_result(
+            user_id, chat_id, 15, 10, 0
+        )
+        bypassed_jugg = await self.database.apply_jugg_result(
+            user_id, chat_id, 15, 10, 0, bypass_cooldown=True
+        )
+        self.assertEqual(first_jugg["status"], "ok")
+        self.assertEqual(blocked_jugg["status"], "cooldown")
+        self.assertEqual(bypassed_jugg["status"], "ok")
+
+        self.assertEqual(
+            await self.database.purchase_item(user_id, "bixi", chat_id), "ok"
+        )
+        first_drive = await self.database.complete_vehicle_drive(
+            user_id, chat_id, 0.99, 0.5, 0.99
+        )
+        blocked_drive = await self.database.complete_vehicle_drive(
+            user_id, chat_id, 0.99, 0.5, 0.99
+        )
+        bypassed_drive = await self.database.complete_vehicle_drive(
+            user_id, chat_id, 0.99, 0.5, 0.99, bypass_cooldown=True
+        )
+        self.assertEqual(first_drive["status"], "clear")
+        self.assertEqual(blocked_drive["status"], "cooldown")
+        self.assertEqual(bypassed_drive["status"], "clear")
+
+        attacker_id, victim_id = 231, 232
+        await self.database.ensure_player(attacker_id, "dev_shooter", chat_id)
+        await self.database.ensure_player(victim_id, "target", chat_id)
+        first_shoot = await self.database.apply_shootout_result(
+            attacker_id, victim_id, attacker_id, 10, False, None, chat_id=chat_id
+        )
+        blocked_shoot = await self.database.apply_shootout_result(
+            attacker_id, victim_id, attacker_id, 10, False, None, chat_id=chat_id
+        )
+        bypassed_shoot = await self.database.apply_shootout_result(
+            attacker_id,
+            victim_id,
+            attacker_id,
+            10,
+            False,
+            None,
+            chat_id=chat_id,
+            bypass_cooldown=True,
+        )
+        self.assertEqual(first_shoot["status"], "ok")
+        self.assertEqual(blocked_shoot["status"], "cooldown")
+        self.assertEqual(bypassed_shoot["status"], "ok")
+
+        async with self.database.transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE players SET in_prison_until = ?
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (time.time() + PRISON_DURATION_SECONDS, user_id, chat_id),
+            )
+        jailed_hustle = await self.database.apply_hustle_result(
+            user_id, chat_id, 20, 10, 0, bypass_cooldown=True
+        )
+        self.assertEqual(jailed_hustle[0], "prison")
 
     async def test_hustle_cooldowns_are_bounded_including_existing_profiles(self) -> None:
         await self.database.ensure_player(101, "rabza")
@@ -1280,6 +1695,13 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         database = Database(str(database_path))
         await database.initialize()
         self.assertTrue(database_path.is_file())
+
+    async def test_relative_database_path_is_anchored_to_project_root(self) -> None:
+        database = Database("relative-state.sqlite3")
+        self.assertEqual(
+            Path(database.path),
+            Path(__file__).resolve().parents[1] / "relative-state.sqlite3",
+        )
 
     async def test_initialize_alters_existing_context_players_to_add_bank(self) -> None:
         existing_path = Path(self.temp_dir.name) / "existing.sqlite3"

@@ -27,8 +27,8 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from config import BOT_TOKEN, DATABASE_PATH, validate_config
-from database import Database
+from config import ADMIN_USER_IDS, BOT_TOKEN, DATABASE_PATH, validate_config
+from database import MAX_ADMIN_BALANCE, MAX_ADMIN_XP, Database
 from game import (
     ACTION_SPECS,
     BAIL_COST,
@@ -384,7 +384,646 @@ async def help_command(
         "/jugg — ouvrir les activités d’arcade et leurs paliers\n"
         "/juggling — alias de /jugg\n"
         "/casino — ouvrir les jeux et consulter leur syntaxe\n\n"
+        "/admin — ouvrir le panneau réservé aux administrateurs\n"
+        "/devmode — basculer le mode Joueur / Développeur (admin seulement)\n"
+        "/give_cash [@username] [montant|max] [cash|bank] — sans montant, porter le solde au plafond admin\n"
+        "/give_xp [@username] [montant|max] — sans montant, porter l'XP au plafond admin\n"
+        "/set_level [@username] [niveau] — sans niveau, passer au niveau maximum\n"
+        "/give_item [@username] [id_item|nom|all] — sans item ou avec all, donner le catalogue complet\n"
+        "/give_infinite [@username] [montant] [cash|bank] — crédit admin (1 milliard par défaut)\n"
+        "/admin_reset [@username] [repair|full CONFIRMER] — réparer ou réinitialiser un profil\n\n"
         "Dans les groupes, les commandes fonctionnent aussi avec la mention du bot."
+    )
+
+
+ADMIN_DENIED_MESSAGE = (
+    "🚫 T'as cru t'étais le maire du quartier ? Passe ton chemin."
+)
+ADMIN_PANEL_TEXT = (
+    "🔐 Panneau de contrôle\n"
+    "Les actions sont limitées au groupe où tu lances la commande."
+)
+
+
+def is_admin(update: Update) -> bool:
+    user = update.effective_user
+    return user is not None and not user.is_bot and user.id in ADMIN_USER_IDS
+
+
+async def developer_mode_enabled(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int
+) -> bool:
+    if user_id not in ADMIN_USER_IDS:
+        return False
+    return await database_for(context).get_admin_dev_mode(user_id)
+
+
+async def require_admin_dev_mode(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    message: Message,
+) -> bool:
+    if not is_admin(update):
+        await message.reply_text(ADMIN_DENIED_MESSAGE)
+        return False
+    user = update.effective_user
+    if user is None or not await developer_mode_enabled(context, user.id):
+        await message.reply_text(
+            "🔒 Outil verrouillé en Mode Joueur. Active le Mode Développeur avec /devmode."
+        )
+        return False
+    return True
+
+
+def admin_panel_text(dev_mode: bool) -> str:
+    mode = "🧪 Mode Développeur [DEV]" if dev_mode else "🎮 Mode Joueur"
+    return f"{ADMIN_PANEL_TEXT}\nÉtat actuel : {mode}."
+
+
+def admin_panel_keyboard(
+    admin_id: int, dev_mode: bool
+) -> InlineKeyboardMarkup:
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🎮 Revenir au Mode Joueur"
+                if dev_mode
+                else "🧪 Activer le Mode Développeur",
+                callback_data=f"admin:{admin_id}:toggle",
+            )
+        ]
+    ]
+    if dev_mode:
+        keyboard.extend(
+            [
+                [
+                    InlineKeyboardButton(
+                        "💸 Donner du cash",
+                        callback_data=f"admin:{admin_id}:credit",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✨ Donner de l'XP",
+                        callback_data=f"admin:{admin_id}:xp",
+                    ),
+                    InlineKeyboardButton(
+                        "⭐ Fixer le niveau",
+                        callback_data=f"admin:{admin_id}:level",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🎁 Donner un item / véhicule",
+                        callback_data=f"admin:{admin_id}:item",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🩹 Réparer sans perte",
+                        callback_data=f"admin:{admin_id}:repair",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "♻️ Réinitialisation complète",
+                        callback_data=f"admin:{admin_id}:reset",
+                    )
+                ],
+            ]
+        )
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    user = update.effective_user
+    if user is None or not is_admin(update):
+        await message.reply_text(ADMIN_DENIED_MESSAGE)
+        return
+    dev_mode = await developer_mode_enabled(context, user.id)
+    await message.reply_text(
+        admin_panel_text(dev_mode),
+        reply_markup=admin_panel_keyboard(user.id, dev_mode),
+    )
+
+
+async def devmode(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None:
+        return
+    if user is None or not is_admin(update):
+        await message.reply_text(ADMIN_DENIED_MESSAGE)
+        return
+    enabled = await database_for(context).toggle_admin_dev_mode(user.id)
+    await message.reply_text(
+        f"Mode {'Développeur [DEV]' if enabled else 'Joueur'} activé.",
+        reply_markup=admin_panel_keyboard(user.id, enabled),
+    )
+
+
+async def admin_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None:
+        return
+    if user is None or user.is_bot or user.id not in ADMIN_USER_IDS:
+        await query.answer(ADMIN_DENIED_MESSAGE, show_alert=True)
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "admin" or parts[1] != str(user.id):
+        await query.answer(ADMIN_DENIED_MESSAGE, show_alert=True)
+        return
+
+    database = database_for(context)
+    if parts[2] == "toggle":
+        dev_mode = await database.toggle_admin_dev_mode(user.id)
+        await query.answer(
+            "Mode Développeur activé." if dev_mode else "Mode Joueur activé."
+        )
+        await edit_callback_message(
+            query,
+            admin_panel_text(dev_mode),
+            reply_markup=admin_panel_keyboard(user.id, dev_mode),
+        )
+        return
+    if parts[2] == "home":
+        dev_mode = await developer_mode_enabled(context, user.id)
+        await query.answer()
+        await edit_callback_message(
+            query,
+            admin_panel_text(dev_mode),
+            reply_markup=admin_panel_keyboard(user.id, dev_mode),
+        )
+        return
+    if not await developer_mode_enabled(context, user.id):
+        await query.answer(
+            "Active le Mode Développeur avec /devmode pour utiliser ces outils.",
+            show_alert=True,
+        )
+        return
+    await query.answer()
+    instructions = {
+        "credit": (
+            "💸 Donner du cash ou remplir un compte\n"
+            "Pour toi : /give_cash [montant|max] [cash|bank].\n"
+            "Pour un joueur : /give_cash @username [montant|max] [cash|bank], "
+            "ou réponds à son message avec /give_cash [montant|max] [cash|bank].\n"
+            f"Sans montant ou avec max, le solde sélectionné passe à "
+            f"{MAX_ADMIN_BALANCE}$."
+        ),
+        "xp": (
+            "✨ Donner de l'XP\n"
+            f"Pour toi : /give_xp [montant|max] (sans montant: {MAX_ADMIN_XP} XP).\n"
+            "Pour un joueur : /give_xp @username [montant|max], "
+            "ou réponds à son message avec /give_xp [montant|max]."
+        ),
+        "level": (
+            "⭐ Fixer le niveau\n"
+            f"Pour toi : /set_level [niveau 1-{MAX_LEVEL}] (sans niveau: maximum).\n"
+            f"Pour un joueur : /set_level @username [niveau 1-{MAX_LEVEL}], "
+            "ou réponds à son message. L'XP est ajustée au seuil du niveau."
+        ),
+        "item": (
+            "🎁 Donner un item ou véhicule du catalogue\n"
+            "Pour toi : /give_item [id_item|nom|all].\n"
+            "Pour un joueur : /give_item @username [id_item|nom|all], "
+            "ou réponds à son message avec /give_item [id_item|nom|all].\n"
+            "Sans item ou avec all, le catalogue entier est ajouté."
+        ),
+        "repair": (
+            "🩹 Réparation non destructive\n"
+            "Réponds au joueur avec /admin_reset repair, ou utilise "
+            "/admin_reset @username repair.\n"
+            "Ses soldes, son niveau, son XP et son inventaire sont conservés."
+        ),
+        "reset": (
+            "♻️ Réinitialisation complète\n"
+            "Réponds au joueur avec /admin_reset full CONFIRMER, ou utilise "
+            "/admin_reset @username full CONFIRMER.\n"
+            "Cash, banque, progression, inventaire et location active seront remis à zéro."
+        ),
+    }
+    instruction = instructions.get(parts[2])
+    if instruction is None:
+        await edit_callback_message(query, "Cette action admin n’existe pas.")
+        return
+    await edit_callback_message(
+        query,
+        instruction,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Panneau admin",
+                        callback_data=f"admin:{user.id}:home",
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+async def resolve_admin_target(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    arguments: list[str],
+    create_replied_profile: bool = False,
+    allow_self: bool = False,
+    create_self_profile: bool = False,
+) -> tuple[dict[str, object] | None, list[str], str | None]:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return None, arguments, "Impossible de déterminer la conversation."
+
+    reply_to = getattr(message, "reply_to_message", None)
+    if reply_to is not None:
+        target_user = getattr(reply_to, "from_user", None)
+        if target_user is None or target_user.is_bot:
+            return None, arguments, "La réponse doit viser le message d’un joueur."
+        database = database_for(context)
+        target = await database.get_player(target_user.id, chat.id)
+        if target is None and create_replied_profile:
+            await database.ensure_player(target_user.id, target_user.username, chat.id)
+            target = await database.get_player(target_user.id, chat.id)
+        if target is None:
+            return (
+                None,
+                arguments,
+                "Ce joueur n’a pas encore de profil dans cette conversation.",
+            )
+        return target, arguments, None
+
+    if allow_self and (not arguments or not arguments[0].startswith("@")):
+        user = update.effective_user
+        if user is None or user.is_bot:
+            return None, arguments, "Impossible de déterminer l'administrateur."
+        database = database_for(context)
+        target = await database.get_player(user.id, chat.id)
+        if target is None and create_self_profile:
+            await database.ensure_player(user.id, user.username, chat.id)
+            target = await database.get_player(user.id, chat.id)
+        if target is None:
+            return None, arguments, "Ton profil n’existe pas dans cette conversation."
+        return target, arguments, None
+
+    if not arguments or not arguments[0].startswith("@"):
+        return (
+            None,
+            arguments,
+            "Indique @username ou réponds au message du joueur ciblé.",
+        )
+    target = await database_for(context).get_player_by_username(
+        arguments[0][1:], chat.id
+    )
+    if target is None:
+        return (
+            None,
+            arguments[1:],
+            "Joueur introuvable dans cette conversation. Il doit avoir un profil actif.",
+        )
+    return target, arguments[1:], None
+
+
+async def give_infinite(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+    if not await require_admin_dev_mode(update, context, message):
+        return
+
+    target, remaining, error = await resolve_admin_target(
+        update,
+        context,
+        list(context.args or []),
+        create_replied_profile=True,
+    )
+    if target is None:
+        await message.reply_text(
+            f"{error}\nUsage: /give_infinite @username [montant] [cash|bank], "
+            "ou réponds au joueur avec /give_infinite [montant] [cash|bank]."
+        )
+        return
+
+    amount = 1_000_000_000
+    account = "cash"
+    if remaining:
+        if remaining[0].casefold() in {"cash", "bank", "banque"}:
+            account = "bank" if remaining.pop(0).casefold() in {"bank", "banque"} else "cash"
+        else:
+            try:
+                amount = int(remaining.pop(0))
+            except ValueError:
+                await message.reply_text("Le montant doit être un entier positif.")
+                return
+        if remaining:
+            if len(remaining) != 1 or remaining[0].casefold() not in {
+                "cash", "bank", "banque"
+            }:
+                await message.reply_text(
+                    "Usage: /give_infinite @username [montant] [cash|bank]."
+                )
+                return
+            account = (
+                "bank" if remaining[0].casefold() in {"bank", "banque"} else "cash"
+            )
+
+    result = await database_for(context).admin_credit_player(
+        int(target["user_id"]), chat.id, amount, account
+    )
+    if result["status"] == "missing":
+        await message.reply_text("Profil introuvable dans cette conversation.")
+    elif result["status"] == "invalid":
+        await message.reply_text("Le montant doit être supérieur à zéro.")
+    elif result["status"] == "limit":
+        await message.reply_text("Le solde maximal autorisé par la base est atteint.")
+    else:
+        target_name = str(target.get("username") or target["user_id"])
+        await message.reply_text(
+            f"✅ Crédit admin appliqué à {target_name}: +{amount}$ en "
+            f"{'banque' if account == 'bank' else 'cash'}."
+        )
+
+
+async def give_cash(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+    if not await require_admin_dev_mode(update, context, message):
+        return
+
+    target, remaining, error = await resolve_admin_target(
+        update,
+        context,
+        list(context.args or []),
+        allow_self=True,
+        create_self_profile=True,
+    )
+    if target is None:
+        await message.reply_text(
+            f"{error}\nUsage: /give_cash [@username] [montant|max] [cash|bank]."
+        )
+        return
+
+    account_names = {"cash": "cash", "bank": "bank", "banque": "bank"}
+    account_tokens = [token.casefold() for token in remaining if token.casefold() in account_names]
+    if len(account_tokens) > 1:
+        await message.reply_text(
+            "Usage: /give_cash [@username] [montant|max] [cash|bank]."
+        )
+        return
+    account = account_names[account_tokens[0]] if account_tokens else "cash"
+    amount_tokens = [
+        token for token in remaining if token.casefold() not in account_names
+    ]
+    if len(amount_tokens) > 1:
+        await message.reply_text(
+            "Usage: /give_cash [@username] [montant|max] [cash|bank]."
+        )
+        return
+    amount: int | None
+    if not amount_tokens:
+        amount = None
+    elif amount_tokens[0].casefold() in {"max", "maximum", "plafond", "infini", "infinite"}:
+        amount = None
+    elif amount_tokens[0].isdecimal():
+        amount = int(amount_tokens[0])
+    else:
+        await message.reply_text("Le montant doit être un entier positif ou « max ».")
+        return
+    if amount is not None and amount <= 0:
+        await message.reply_text("Le montant doit être supérieur à zéro.")
+        return
+
+    result = await database_for(context).admin_credit_player(
+        int(target["user_id"]), chat.id, amount, account
+    )
+    if result["status"] == "missing":
+        await message.reply_text("Profil introuvable dans cette conversation.")
+    elif result["status"] == "invalid":
+        await message.reply_text("Le montant ou le compte demandé est invalide.")
+    elif result["status"] == "limit":
+        await message.reply_text(
+            f"Le compte est déjà au plafond admin de {MAX_ADMIN_BALANCE}$ "
+            "ou le montant dépasserait la limite de stockage."
+        )
+    else:
+        current_balance = int(target[account])
+        credited = int(result[account]) - current_balance
+        target_name = str(target.get("username") or target["user_id"])
+        await message.reply_text(
+            f"✅ Crédit admin appliqué à {target_name}: +{credited}$ en "
+            f"{'banque' if account == 'bank' else 'cash'}."
+        )
+
+
+async def give_xp(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+    if not await require_admin_dev_mode(update, context, message):
+        return
+    target, remaining, error = await resolve_admin_target(
+        update,
+        context,
+        list(context.args or []),
+        allow_self=True,
+        create_self_profile=True,
+    )
+    if target is None:
+        await message.reply_text(
+            f"{error}\nUsage: /give_xp [@username] [montant|max]."
+        )
+        return
+    if len(remaining) > 1:
+        await message.reply_text(
+            "Usage: /give_xp [@username] [montant|max]."
+        )
+        return
+    amount: int | None = None
+    if remaining and remaining[0].casefold() not in {
+        "max", "maximum", "plafond", "infini", "infinite"
+    }:
+        if not remaining[0].isdecimal():
+            await message.reply_text(
+                "L’XP doit être un entier positif ou « max »."
+            )
+            return
+        amount = int(remaining[0])
+    result = await database_for(context).admin_give_xp(
+        int(target["user_id"]), chat.id, amount
+    )
+    if result["status"] == "missing":
+        await message.reply_text("Profil introuvable dans cette conversation.")
+    elif result["status"] == "invalid":
+        await message.reply_text("Le montant d’XP doit être supérieur à zéro.")
+    elif result["status"] == "limit":
+        await message.reply_text("Le montant dépasserait la limite de stockage XP.")
+    else:
+        target_name = str(target.get("username") or target["user_id"])
+        await message.reply_text(
+            f"✅ +{result['xp_added']} XP pour {target_name}. "
+            f"Niveau actuel: {result['level']} (total: {result['xp']} XP)."
+        )
+
+
+async def set_level(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+    if not await require_admin_dev_mode(update, context, message):
+        return
+    target, remaining, error = await resolve_admin_target(
+        update,
+        context,
+        list(context.args or []),
+        allow_self=True,
+        create_self_profile=True,
+    )
+    if target is None:
+        await message.reply_text(
+            f"{error}\nUsage: /set_level [@username] [niveau 1-{MAX_LEVEL}]."
+        )
+        return
+    if len(remaining) > 1 or (remaining and not remaining[0].isdecimal()):
+        await message.reply_text(
+            f"Usage: /set_level [@username] [niveau 1-{MAX_LEVEL}]."
+        )
+        return
+    level = int(remaining[0]) if remaining else MAX_LEVEL
+    result = await database_for(context).admin_set_level(
+        int(target["user_id"]), chat.id, level
+    )
+    if result["status"] == "missing":
+        await message.reply_text("Profil introuvable dans cette conversation.")
+    elif result["status"] == "invalid":
+        await message.reply_text(f"Le niveau doit être compris entre 1 et {MAX_LEVEL}.")
+    else:
+        target_name = str(target.get("username") or target["user_id"])
+        await message.reply_text(
+            f"✅ {target_name} est maintenant niveau {result['level']} "
+            f"({result['xp']} XP)."
+        )
+
+
+async def give_item(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+    if not await require_admin_dev_mode(update, context, message):
+        return
+    target, remaining, error = await resolve_admin_target(
+        update,
+        context,
+        list(context.args or []),
+        allow_self=True,
+        create_self_profile=True,
+    )
+    if target is None:
+        await message.reply_text(
+            f"{error}\nUsage: /give_item [@username] [id_item|nom|all]."
+        )
+        return
+    result = await database_for(context).admin_give_item(
+        int(target["user_id"]),
+        chat.id,
+        " ".join(remaining).casefold() if remaining else None,
+    )
+    if result["status"] == "missing":
+        await message.reply_text("Profil introuvable dans cette conversation.")
+    elif result["status"] == "invalid_item":
+        await message.reply_text(
+            "Identifiant inconnu. Choisis un id_item présent dans le catalogue du /shop."
+        )
+    else:
+        target_name = str(target.get("username") or target["user_id"])
+        if result.get("item_id") == "all":
+            await message.reply_text(
+                f"✅ Catalogue complet: {result['count']} articles, véhicules et "
+                f"sapes vérifiés dans l’inventaire de {target_name}."
+            )
+        else:
+            await message.reply_text(
+                f"✅ {result['name']} ajouté à l’inventaire de {target_name}."
+            )
+
+
+async def admin_reset(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+    if not await require_admin_dev_mode(update, context, message):
+        return
+
+    target, remaining, error = await resolve_admin_target(
+        update, context, list(context.args or [])
+    )
+    if target is None:
+        await message.reply_text(
+            f"{error}\nUsage: réponds au joueur avec /admin_reset [repair|full CONFIRMER], "
+            "ou /admin_reset @username [repair|full CONFIRMER]."
+        )
+        return
+
+    mode = remaining[0].casefold() if remaining else "repair"
+    if mode == "repair" and len(remaining) <= 1:
+        result = await database_for(context).admin_repair_player(
+            int(target["user_id"]), chat.id
+        )
+        if result == "missing":
+            await message.reply_text("Profil introuvable dans cette conversation.")
+            return
+        await message.reply_text(
+            "🩹 Profil réparé. Cash, banque, niveau, XP et inventaire sont préservés."
+        )
+        return
+    if mode == "full":
+        if len(remaining) != 2 or remaining[1] != "CONFIRMER":
+            await message.reply_text(
+                "⚠️ Cette action efface progression et inventaire. "
+                "Pour confirmer, renvoie /admin_reset full CONFIRMER en réponse "
+                "au joueur ciblé, ou /admin_reset @username full CONFIRMER."
+            )
+            return
+        result = await database_for(context).admin_reset_player(
+            int(target["user_id"]), chat.id
+        )
+        if result == "missing":
+            await message.reply_text("Profil introuvable dans cette conversation.")
+            return
+        await message.reply_text(
+            "♻️ Profil réinitialisé dans cette conversation uniquement."
+        )
+        return
+
+    await message.reply_text(
+        "Mode inconnu. Choisis repair, ou full CONFIRMER pour remettre le profil à zéro."
     )
 
 
@@ -401,13 +1040,17 @@ async def profil(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     items = await database.get_inventory(actor_info["id"], chat.id)
+    god_mode = await developer_mode_enabled(context, actor_info["id"])
+    dev_badge = " [DEV]" if god_mode else ""
     inventory_text = (
         ", ".join(f"{item['name']} ×{item['quantity']}" for item in items)
         if items
         else "vide"
     )
     remaining_seconds = prison_remaining_seconds(player)
-    if remaining_seconds:
+    if god_mode:
+        status = "Immunité active — aucune peine en Mode Développeur"
+    elif remaining_seconds:
         status = f"En taule à Bordeaux/RDP — encore {remaining_seconds} s"
     elif player["in_prison_until"]:
         status = "Libre (ta peine est finie, c'est carré)"
@@ -415,7 +1058,7 @@ async def profil(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         status = "Libre"
 
     await message.reply_text(
-        f"📍 Profil de {actor_info['name']}\n"
+        f"📍 Profil de {actor_info['name']}{dev_badge}\n"
         f"💵 Kob: {player['cash']}$\n"
         f"🏦 Banque: {player['bank']}$\n"
         f"🚘 Gamos: {player['gamos']}\n"
@@ -563,25 +1206,38 @@ async def jugg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         raise RuntimeError(
             f"Le joueur {actor_info['id']} est introuvable après son enregistrement."
         )
+    god_mode = await developer_mode_enabled(context, actor_info["id"])
     jail_seconds = prison_remaining_seconds(player)
-    if jail_seconds:
+    if jail_seconds and not god_mode:
         await message.reply_text(
             f"T'es encore à Bordeaux/RDP pour {jail_seconds} seconde(s). "
             "Réessaie quand le compteur tombe à zéro."
         )
         return
     available = actions_available(player["level"], bool(effects["has_obd"]))
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                f"{tier.title} — jusqu'à {tier.success_reward}$ "
-                f"(+{tier.xp} XP, risque {1 - tier.success_chance:.0%}, "
-                f"cooldown {tier.cooldown_seconds}s)",
-                callback_data=f"jugg:{actor_info['id']}:{tier.tier_id}",
-            )
-        ]
-        for tier in JUGG_TIERS
-    ] + [
+    cooldown_label = (
+        "cooldown ignoré [DEV]"
+        if god_mode
+        else None
+    )
+    jugg_buttons = []
+    for tier in JUGG_TIERS:
+        cooldown_label = (
+            "cooldown ignoré [DEV]"
+            if god_mode
+            else f"cooldown {tier.cooldown_seconds}s"
+        )
+        jugg_buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{tier.title} — jusqu'à {tier.success_reward}$ "
+                    f"(+{tier.xp} XP, risque {1 - tier.success_chance:.0%}, "
+                    f"{cooldown_label})",
+                    callback_data=f"jugg:{actor_info['id']}:{tier.tier_id}",
+                )
+            ]
+        )
+    keyboard = jugg_buttons + [
         [
             InlineKeyboardButton(
                 spec.title,
@@ -640,6 +1296,7 @@ async def handle_jugg_tier(
         if outcome.success
         else 0
     )
+    god_mode = await developer_mode_enabled(context, actor_info["id"])
     applied = await database.apply_jugg_result(
         actor_info["id"],
         chat.id,
@@ -648,6 +1305,8 @@ async def handle_jugg_tier(
         outcome.heat_delta,
         outcome.prison_seconds,
         xp_gain,
+        bypass_cooldown=god_mode,
+        god_mode=god_mode,
     )
     status = applied["status"]
     if status == "missing":
@@ -673,6 +1332,10 @@ async def handle_jugg_tier(
     cash_delta = int(applied["cash_delta"])
     heat_delta = int(applied["heat_delta"])
     formatted_result = outcome.message
+    if god_mode and outcome.prison_seconds:
+        formatted_result = (
+            "🧪 Mode Développeur: l’incident est neutralisé, aucune peine appliquée."
+        )
     if not outcome.success and outcome.prison_seconds == 0:
         formatted_result = formatted_result.replace(
             f"{tier.failure_fine}$", f"{-cash_delta}$"
@@ -685,7 +1348,11 @@ async def handle_jugg_tier(
         f"✨ XP: +{applied['xp_gain']}\n"
         f"🔥 Heat: {heat_delta:+d} ({applied['heat']}/100) | "
         f"Recherche: {applied['search_level']}/100\n"
-        f"⏱️ Prochain palier dans {applied['cooldown_seconds']}s."
+        + (
+            "⏱️ Cooldown ignoré en Mode Développeur."
+            if god_mode
+            else f"⏱️ Prochain palier dans {applied['cooldown_seconds']}s."
+        )
         + level_up_notice(
             int(applied["previous_level"]), int(applied["level"])
         ),
@@ -719,8 +1386,9 @@ async def handle_game_action(
     if player is None:
         raise RuntimeError(f"Le joueur {actor_info['id']} est introuvable.")
     spec = ACTION_SPECS[action]
+    god_mode = await developer_mode_enabled(context, actor_info["id"])
     jail_seconds = prison_remaining_seconds(player)
-    if jail_seconds:
+    if jail_seconds and not god_mode:
         await edit_callback_message(
             query,
             f"T'es encore à Bordeaux/RDP pour {jail_seconds} seconde(s). "
@@ -767,6 +1435,7 @@ async def handle_game_action(
         prison_until,
         xp_gain,
         chat_id=chat.id,
+        god_mode=god_mode,
     )
     if not applied:
         await edit_callback_message(
@@ -780,7 +1449,11 @@ async def handle_game_action(
         raise RuntimeError(f"Le joueur {actor_info['id']} est introuvable.")
     await edit_callback_message(
         query,
-        f"{result.message}"
+        (
+            "🧪 Mode Développeur: l’incident est neutralisé, aucune peine appliquée."
+            if god_mode and result.prison_seconds
+            else result.message
+        )
         + (
             f"\n✨ +{xp_gain} XP total."
             if result.success
@@ -1382,12 +2055,15 @@ async def drive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     actor_info, chat, message = actor
     database = database_for(context)
+    god_mode = await developer_mode_enabled(context, actor_info["id"])
     result = await database.complete_vehicle_drive(
         actor_info["id"],
         chat.id,
         random.SystemRandom().random(),
         random.SystemRandom().random(),
         random.SystemRandom().random(),
+        bypass_cooldown=god_mode,
+        god_mode=god_mode,
     )
     if result["status"] == "no_vehicle":
         await message.reply_text(
@@ -1445,8 +2121,9 @@ async def repair_vehicle(
     if actor is None:
         return
     actor_info, chat, message = actor
+    god_mode = await developer_mode_enabled(context, actor_info["id"])
     result = await database_for(context).repair_vehicle_rental(
-        actor_info["id"], chat.id
+        actor_info["id"], chat.id, free=god_mode
     )
     if result["status"] == "missing":
         await message.reply_text("Aucune location active à remettre en état.")
@@ -1459,10 +2136,16 @@ async def repair_vehicle(
             f"Il te faut {result['fee']}$ de cash liquide pour les réparations."
         )
     else:
-        await message.reply_text(
-            f"🛠️ {result['name']} remis en état. "
-            f"Frais réglés : {result['fee']}$. Tu peux reprendre la route."
-        )
+        if god_mode:
+            await message.reply_text(
+                f"🛠️ {result['name']} remis en état sans frais. "
+                "Tu peux reprendre la route."
+            )
+        else:
+            await message.reply_text(
+                f"🛠️ {result['name']} remis en état. "
+                f"Frais réglés : {result['fee']}$. Tu peux reprendre la route."
+            )
 
 
 async def return_vehicle(
@@ -1550,8 +2233,9 @@ async def braquer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     attacker = await database.get_player(actor_info["id"], chat.id)
     if attacker is None:
         raise RuntimeError(f"Le joueur {actor_info['id']} est introuvable.")
+    god_mode = await developer_mode_enabled(context, actor_info["id"])
     jail_seconds = prison_remaining_seconds(attacker)
-    if jail_seconds:
+    if jail_seconds and not god_mode:
         await message.reply_text(
             f"T'es encore à Bordeaux pour {jail_seconds} seconde(s). "
             "Le défi PVP sera dispo quand ta peine sera finie."
@@ -1599,6 +2283,7 @@ async def braquer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         xp_with_bonus(result.xp_gain, int(attacker_effects["xp_bonus"])),
         result.transfer_rate,
         chat_id=chat.id,
+        god_mode=god_mode,
     )
     if applied is None:
         await message.reply_text("Défi PVP impossible: cible invalide.")
@@ -1607,11 +2292,16 @@ async def braquer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif applied["status"] == "prison":
         await message.reply_text("T'es en taule; aucun défi PVP possible pour le moment.")
     elif applied["status"] == "counter":
+        prison_notice = (
+            f"Tu prends {PRISON_DURATION_SECONDS} secondes à Bordeaux"
+            if not god_mode
+            else "La peine est neutralisée par le Mode Développeur"
+        )
         await message.reply_text(
             f"💥 Riposte de jeu! @{victim['username']} bloque le braquage avec "
             f"son équipement "
             f"({victim_effects['armor_name'] or victim_weapon['name'] or 'de défense'}). "
-            f"Tu prends {PRISON_DURATION_SECONDS} secondes à Bordeaux et verses "
+            f"{prison_notice} et verses "
             f"{applied['fine']}$ à "
             f"@{victim['username']}."
         )
@@ -1623,8 +2313,13 @@ async def braquer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             + level_up_notice(int(attacker["level"]), int(applied["level"]))
         )
     else:
+        prison_notice = (
+            f"Direction Bordeaux pour {PRISON_DURATION_SECONDS} secondes."
+            if not god_mode
+            else "🧪 Mode Développeur: aucune peine appliquée."
+        )
         await message.reply_text(
-            f"{result.message} Direction Bordeaux pour {PRISON_DURATION_SECONDS} secondes. "
+            f"{result.message} {prison_notice} "
             "Aucun cash n'a changé de mains."
         )
 
@@ -1642,8 +2337,9 @@ async def shoot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     attacker = await database.get_player(actor_info["id"], chat.id)
     if attacker is None:
         raise RuntimeError(f"Le joueur {actor_info['id']} est introuvable.")
+    god_mode = await developer_mode_enabled(context, actor_info["id"])
     jail_seconds = prison_remaining_seconds(attacker)
-    if jail_seconds:
+    if jail_seconds and not god_mode:
         await message.reply_text(
             f"🚔 Tu es en taule pour encore {jail_seconds}s; le duel est bloqué."
         )
@@ -1706,6 +2402,8 @@ async def shoot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         outcome.police_intervention,
         deadline,
         chat_id=chat.id,
+        bypass_cooldown=god_mode,
+        god_mode=god_mode,
     )
     if applied is None:
         await message.reply_text("Le duel n’a pas pu être lancé.")
@@ -1738,7 +2436,7 @@ async def shoot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     police_notice = (
         f" Intervention de police : {loser_name} part en taule "
         f"{applied['prison_seconds']}s."
-        if applied["police_intervention"]
+        if applied["prison_seconds"]
         else ""
     )
     await message.reply_text(
@@ -1885,6 +2583,11 @@ async def prison(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         raise RuntimeError(
             f"Le joueur {actor_info['id']} est introuvable après son enregistrement."
         )
+    if await developer_mode_enabled(context, actor_info["id"]):
+        await message.reply_text(
+            "🧪 Immunité active en Mode Développeur : aucune peine ni caution à gérer."
+        )
+        return
     prison_until = player["in_prison_until"]
     remaining_seconds = prison_remaining_seconds(player)
     if not prison_until:
@@ -1919,6 +2622,11 @@ async def evade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if actor is None:
         return
     actor_info, chat, message = actor
+    if await developer_mode_enabled(context, actor_info["id"]):
+        await message.reply_text(
+            "🧪 Immunité active en Mode Développeur. Pas besoin de tenter une évasion."
+        )
+        return
     success = random.random() < 0.25
     result, remaining, search_level = await database_for(context).try_escape(
         actor_info["id"], chat.id, success
@@ -1955,6 +2663,7 @@ async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if player is None:
         await message.reply_text("Ton profil n'est pas encore créé. Tape /start!")
         return
+    god_mode = await developer_mode_enabled(context, actor_info["id"])
 
     if not args:
         lines = [
@@ -1981,7 +2690,11 @@ async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Réussite: {hustle.success_chance:.0%} | "
             f"Gain fixe: {hustle.success_reward}$ | XP: {hustle.xp} | "
             f"Échec: -{hustle.failure_penalty}$ | "
-            f"Cooldown: {hustle.cooldown_seconds}s"
+            + (
+                "Cooldown ignoré [DEV]"
+                if god_mode
+                else f"Cooldown: {hustle.cooldown_seconds}s"
+            )
             + (" | véhicule requis" if hustle.mission_id == "colis" else "")
             for hustle in HUSTLES
         )
@@ -1991,7 +2704,15 @@ async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = " ".join(args)
     hustle = find_hustle(query)
     if hustle is not None:
-        await run_hustle(actor_info, chat.id, message, database, hustle)
+        await run_hustle(
+            actor_info,
+            chat.id,
+            message,
+            database,
+            hustle,
+            god_mode,
+            god_mode,
+        )
         return
 
     mission = find_mission(query)
@@ -2007,7 +2728,7 @@ async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Le joueur {actor_info['id']} est introuvable après son enregistrement."
         )
     jail_seconds = prison_remaining_seconds(player)
-    if jail_seconds:
+    if jail_seconds and not god_mode:
         await message.reply_text(
             f"{actor_info['name']}, tu es encore en taule pour "
             f"{jail_seconds} seconde(s)."
@@ -2033,7 +2754,11 @@ async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if uses_vehicle
         else None
     )
-    if rental is not None and int(rental.get("repair_due", 0)) > 0:
+    if (
+        not god_mode
+        and rental is not None
+        and int(rental.get("repair_due", 0)) > 0
+    ):
         await message.reply_text(
             f"🛠️ {rental['name']} attend sa remise en état. "
             f"Règle {rental['repair_due']}$ avec /repair avant la mission."
@@ -2052,6 +2777,7 @@ async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             None,
             xp_gain=xp_gain,
             chat_id=chat.id,
+            god_mode=god_mode,
         )
     else:
         fine_limit = min(250, int(player["cash"]))
@@ -2064,6 +2790,7 @@ async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             None,
             prison_deadline(PRISON_DURATION_SECONDS) if jailed else None,
             chat_id=chat.id,
+            god_mode=god_mode,
         )
 
     if not applied:
@@ -2091,6 +2818,7 @@ async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             chat.id,
             random.SystemRandom().random(),
             random.SystemRandom().random(),
+            free_repair=god_mode,
         )
         vehicle_notice = rental_trip_message(trip_result)
     if succeeded:
@@ -2109,6 +2837,8 @@ async def missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         penalty = (
             f"🚔 Tu prends {PRISON_DURATION_SECONDS} secondes de taule "
             "dans le jeu."
+            if not god_mode
+            else "🧪 Mode Développeur: la peine est neutralisée."
         )
     else:
         penalty = "Tu as réussi à filer, sans taule."
@@ -2126,6 +2856,8 @@ async def run_hustle(
     message: Message,
     database: Database,
     hustle: HustleSpec,
+    bypass_cooldown: bool = False,
+    god_mode: bool = False,
 ) -> None:
     """Resolve a fictional hustle and atomically apply its cooldown and outcome."""
     player = await database.get_player(actor_info["id"], chat_id)
@@ -2140,7 +2872,11 @@ async def run_hustle(
             )
             return
         rental = await database.get_vehicle_rental(actor_info["id"], chat_id)
-        if rental is not None and int(rental.get("repair_due", 0)) > 0:
+        if (
+            not god_mode
+            and rental is not None
+            and int(rental.get("repair_due", 0)) > 0
+        ):
             await message.reply_text(
                 f"🛠️ {rental['name']} attend sa remise en état. "
                 f"Règle {rental['repair_due']}$ avec /repair avant le trajet."
@@ -2168,6 +2904,8 @@ async def run_hustle(
             cash_delta,
             search_delta,
             xp_gain=xp_reward,
+            bypass_cooldown=bypass_cooldown,
+            god_mode=god_mode,
         )
     )
     if status == "missing":
@@ -2202,6 +2940,7 @@ async def run_hustle(
             chat_id,
             random.SystemRandom().random(),
             random.SystemRandom().random(),
+            free_repair=god_mode,
         )
         vehicle_notice = rental_trip_message(trip_result)
     if succeeded:
@@ -2222,8 +2961,12 @@ async def run_hustle(
         f"🚨 Recherche: {search_delta:+d} "
         f"({updated_player['search_level']}/100)\n"
         f"💰 Solde: {balance}$\n"
-        f"⏱️ Prochain hustle dans {hustle.cooldown_seconds}s."
-        f"{vehicle_notice}"
+        + (
+            "⏱️ Cooldown ignoré en Mode Développeur."
+            if god_mode
+            else f"⏱️ Prochain hustle dans {hustle.cooldown_seconds}s."
+        )
+        + f"{vehicle_notice}"
         + level_up_notice(int(player["level"]), int(updated_player["level"])),
         parse_mode="HTML",
     )
@@ -2238,7 +2981,16 @@ async def hustle_command(
     if actor is None:
         return
     actor_info, chat, message = actor
-    await run_hustle(actor_info, chat.id, message, database_for(context), hustle)
+    god_mode = await developer_mode_enabled(context, actor_info["id"])
+    await run_hustle(
+        actor_info,
+        chat.id,
+        message,
+        database_for(context),
+        hustle,
+        god_mode,
+        god_mode,
+    )
 
 
 async def hustle_alias(
@@ -2488,6 +3240,12 @@ async def pay_bail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if actor is None:
         return
     actor_info, chat = actor[0], actor[1]
+    if await developer_mode_enabled(context, actor_info["id"]):
+        await edit_callback_message(
+            query,
+            "🧪 Immunité active en Mode Développeur: aucune caution à payer.",
+        )
+        return
     released = await database_for(context).pay_bail(
         actor_info["id"], BAIL_COST, chat.id
     )
@@ -2555,6 +3313,14 @@ def main() -> None:
     application.add_handler(CommandHandler("mission_depanneur", mission_depanneur))
     application.add_handler(CommandHandler("mission_sneakers", mission_sneakers))
     application.add_handler(CommandHandler("casino", casino_command))
+    application.add_handler(CommandHandler("admin", admin))
+    application.add_handler(CommandHandler("devmode", devmode))
+    application.add_handler(CommandHandler("give_cash", give_cash))
+    application.add_handler(CommandHandler("give_xp", give_xp))
+    application.add_handler(CommandHandler("set_level", set_level))
+    application.add_handler(CommandHandler("give_item", give_item))
+    application.add_handler(CommandHandler("give_infinite", give_infinite))
+    application.add_handler(CommandHandler("admin_reset", admin_reset))
     application.add_handler(
         CallbackQueryHandler(
             handle_bank_callback,
@@ -2572,6 +3338,9 @@ def main() -> None:
             handle_game_action,
             pattern=r"^game:",
         )
+    )
+    application.add_handler(
+        CallbackQueryHandler(admin_callback, pattern=r"^admin:")
     )
     application.add_handler(
         CallbackQueryHandler(shop_callback, pattern=r"^(shop:|buy:)")
