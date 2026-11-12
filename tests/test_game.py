@@ -210,6 +210,57 @@ class ResolveActionTests(unittest.TestCase):
         self.assertEqual(no_counter.outcome, "success")
         self.assertAlmostEqual(no_counter.transfer_rate, 0.33)
 
+    def test_stronger_weapons_improve_robbery_and_target_defense(self) -> None:
+        from game import resolve_pvp
+
+        weaker_weapon = resolve_pvp(
+            attacker_has_weapon=True,
+            victim_has_weapon=False,
+            attacker_weapon_power=1,
+            victim_weapon_power=0,
+            attack_roll=0.70,
+            counter_roll=0.99,
+            transfer_roll=0.99,
+        )
+        stronger_weapon = resolve_pvp(
+            attacker_has_weapon=True,
+            victim_has_weapon=False,
+            attacker_weapon_power=3,
+            victim_weapon_power=0,
+            attack_roll=0.70,
+            counter_roll=0.99,
+            transfer_roll=0.99,
+        )
+        victim_armed = resolve_pvp(
+            attacker_has_weapon=True,
+            victim_has_weapon=True,
+            attacker_weapon_power=1,
+            victim_weapon_power=3,
+            attack_roll=0.1,
+            counter_roll=0.70,
+            transfer_roll=0.5,
+        )
+        self.assertEqual(weaker_weapon.outcome, "failed")
+        self.assertEqual(stronger_weapon.outcome, "success")
+        self.assertGreater(stronger_weapon.transfer_rate, 0.35)
+        self.assertEqual(victim_armed.outcome, "counter")
+
+    def test_shootout_is_power_weighted_and_reports_police_intervention(self) -> None:
+        from game import resolve_shootout
+
+        attacker_wins = resolve_shootout(
+            3, 1, outcome_roll=0.70, police_roll=0.99
+        )
+        target_wins_with_police = resolve_shootout(
+            1, 3, outcome_roll=0.40, police_roll=0.1
+        )
+        self.assertEqual(attacker_wins.winner, "attacker")
+        self.assertEqual(attacker_wins.xp_gain, 175)
+        self.assertFalse(attacker_wins.police_intervention)
+        self.assertEqual(target_wins_with_police.winner, "victim")
+        self.assertTrue(target_wins_with_police.police_intervention)
+        self.assertEqual(target_wins_with_police.xp_gain, 175)
+
     def test_virtual_protection_adds_defense_to_pvp_without_a_weapon(self) -> None:
         from game import resolve_pvp
 

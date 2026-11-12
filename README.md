@@ -60,28 +60,37 @@ Ne publie jamais le token dans le code ou dans un dépôt.
 
 ## Commandes
 
-- `/help` — liste des commandes disponibles
-- `/start` — inscription et accueil
-- `/profil` — cash, banque, gamos, heat et statut
-- `/bank` — consulter cash et banque; boutons pour déposer ou retirer tout
-- `/deposit <montant/all>` et `/withdraw <montant/all>` — gérer le compte bancaire
-- `/give <montant>` — envoyer du cash en répondant au message d'un joueur
-- `/give @username <montant>` — envoyer du cash à un joueur inscrit dans le groupe
-- `/jugg` ou `/juggling` — menu d'arcade avec trois paliers à récompenses fixes,
-  risques simulés et cooldowns de 15 à 30 secondes
-- `/shop` — boutique Vêtements & Accessoires (tête, vestes, accessoires, pieds),
-  véhicules et équipement de jeu
-- `/inventory` — inventaire et bonus des items
-- `/braquer @username` — défi PVP fictif (niveau 20+)
-- `/top` — classement des dix joueurs les plus riches du contexte courant
-- `/prison` — temps restant et option de caution (300$)
-- `/evade` — tentative d'évasion fictive; un échec prolonge la peine
-- `/missions`, `/mission` ou `/hustle` — catalogue et défis fictifs avec cash et XP
-- `/mission_colis`, `/mission_phishing`, `/mission_catalyseur`,
-  `/mission_vapote`, `/mission_depanneur` et `/mission_sneakers` — défis
-  d'arcade à récompenses fixes, avec amende de jeu et hausse de l'indice de
-  recherche en cas d'échec
-- `/casino` — menu du casino fictif (blackjack et roulette)
+- `/start` — créer ton profil et rejoindre le quartier
+- `/help` — afficher toutes les commandes et leurs usages
+- `/profil` — consulter cash, banque, niveau, XP et statut
+- `/inventory` — voir tes articles, bonus et location active
+- `/top` — afficher le classement des joueurs de cette conversation
+- `/prison` — voir le temps restant et l’option de caution
+- `/evade` — tenter l’évasion; réussite libre, échec et +30s de peine
+- `/bank` — consulter cash et banque; boutons pour tout déposer ou retirer
+- `/deposit <montant/all>` — déposer du cash liquide en banque
+- `/withdraw <montant/all>` — retirer du cash de la banque
+- `/give <montant>` — transférer du cash en répondant à un joueur
+- `/give @username <montant>` — transférer du cash à un joueur du groupe
+- `/drive` — faire un trajet rémunéré; véhicule requis, cooldown 60s
+- `/ride` — alias de `/drive`
+- `/repair` — payer les réparations avant de reprendre une location endommagée
+- `/return` — restituer une location et récupérer la caution restante
+- `/braquer @username` — tenter un braquage PvP; niveau 20+, groupe seulement
+- `/shoot @username` — duel armé; cible en riposte, butin et cooldown par cible
+- `/shop` — parcourir les sapes, l’équipement, les véhicules et locations
+- `/missions` — consulter les missions, leurs niveaux, gains et prérequis
+- `/mission <id>` — lancer une mission (civic, audi, entrepot, blindee, helico)
+- `/hustle <id>` — lancer un défi (colis, phishing, catalyseur, vapote, etc.)
+- `/mission_colis` — défi logistique; véhicule requis, cooldown 20s
+- `/mission_phishing` — défi d’audit numérique; cooldown 25s
+- `/mission_catalyseur` — défi de contrôle automobile; cooldown 30s
+- `/mission_vapote` — défi de service au kiosque; cooldown 15s
+- `/mission_depanneur` — défi de gestion des stocks; cooldown 30s
+- `/mission_sneakers` — défi de collection; cooldown 25s
+- `/jugg` — ouvrir les activités d’arcade et leurs paliers
+- `/juggling` — alias de `/jugg`
+- `/casino` — ouvrir les jeux et consulter leur syntaxe
 
 Le menu `/jugg` inclut les paliers fictifs Petit Hustle de Bloc (jusqu'à
 1 200$), Gros Business Centre-Ville (4 500$) et Opération Internationale /
@@ -128,18 +137,32 @@ réparties entre tête et visage, corps et vestes, accessoires et sacoches, et
 chaussures. Chaque fiche présente son prix, son niveau requis, sa description
 et ses bonus de jeu. Les accessoires de style restent cosmétiques; aucune
 capacité de dissimulation, de stockage ou d'appareil réel n'est simulée.
-La boutique contient aussi une collection luxe (lunettes, vêtements, sacoches,
-montres et bijoux), achetable dans les catégories Vêtements & Accessoires,
-Accessoires et Luxe.
-La catégorie Véhicules propose également douze nouvelles voitures allemandes,
-japonaises, sportives et SUV. Les achats sont débités du solde et apparaissent
-dans l'inventaire du joueur; les descriptions automobiles sont des éléments RP
-et n'activent pas de capacité de conduite réelle.
+La boutique contient aussi des collections luxe et streetwear (vêtements,
+sacs, montres, bijoux et chaussures), accessibles par marque et type.
+Les véhicules peuvent être achetés définitivement ou loués pour 1 heure,
+24 heures ou 7 jours. Le loyer représente respectivement 10%, 25% ou 50% du
+prix d'achat; la caution représente 30%, 50% ou 75%. Les frais sont débités
+du cash puis de la banque. La caution est restituée à /return ou à l'échéance,
+moins les réparations issues d'incidents aléatoires (25% de risque par trajet).
+Un incident mineur ou modéré immobilise la location jusqu'au paiement des frais
+de remise en état avec `/repair`; un incident majeur termine la location. Une
+caution épuisée entraîne la confiscation. Les locations sont isolées par joueur
+et groupe et apparaissent dans /inventory. `/drive` (alias `/ride`) rapporte
+75$ et 20 XP quand le trajet est clean; l'entretien d'un véhicule possédé est
+rare. Le défi `/mission_colis` et les missions longues exigent un véhicule et
+vérifient le risque de trajet; aucune vérification passive n'est faite.
 Les catégories Armes — Poing, Collection lourde, Collection longue et Protection
 proposent des objets d'arcade fictifs. L'équipement est acheté avec le solde et
 conservé dans l'inventaire; les objets d'arme comptent comme équipement pour les
 défis PVP simulés, et l'équipement de protection ajoute une chance de riposte
 virtuelle. Ces effets sont exclusivement des règles de jeu.
+Les braquages utilisent la meilleure arme de l'inventaire dans le groupe:
+équipement de poing (puissance 1), équipement lourd (2) et équipement long (3).
+Une cible mieux équipée améliore sa défense et peut déclencher une riposte.
+`/shoot` applique les mêmes puissances à un duel aléatoire; son cooldown est de
+60 secondes par attaquant, cible et groupe. Le perdant peut perdre une part de
+son cash liquide, payer des frais de soins et être envoyé en taule; la banque
+reste intacte. Le gagnant reçoit le butin disponible et de l'XP.
 Les bonus d'XP des vêtements et les bonus de réussite d'équipement sont des
 valeurs de jeu abstraites; le bonus des vêtements est le plus élevé parmi les
 vêtements possédés.

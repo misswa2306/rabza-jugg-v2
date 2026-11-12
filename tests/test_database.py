@@ -426,6 +426,10 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             "audemars_piguet_royaloak",
             "cartier_tank",
             "patek_philippe_nautilus",
+            "dior_oblique_sweater",
+            "versace_barocco_shirt",
+            "carhartt_wip_double_knee",
+            "lacoste_polo_classic",
         }
         luxury_categories = {"vetement", "accessoire", "luxe"}
         luxury_items = [item for item in ITEMS if item.category in luxury_categories]
@@ -549,6 +553,171 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(inventory[0]["category"], "vehicules")
         self.assertIn("Icône sportive", inventory[0]["description"])
 
+    async def test_vehicle_rental_charges_rent_and_refunds_remaining_deposit(self) -> None:
+        await self.database.ensure_player(501, "rental", -100501)
+        result = await self.database.create_vehicle_rental(
+            501, -100501, "bixi", "1h"
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual((result["rent"], result["deposit"]), (5, 15))
+        player = await self.database.get_player(501, -100501)
+        self.assertEqual(player["cash"], 480)
+
+        trip = await self.database.apply_vehicle_trip(
+            501, -100501, incident_roll=0.9, severity_roll=0.5
+        )
+        self.assertEqual(trip["status"], "clear")
+        returned = await self.database.return_vehicle_rental(501, -100501)
+        self.assertEqual(returned["status"], "returned")
+        self.assertEqual(returned["cash_refund"], 15)
+        player = await self.database.get_player(501, -100501)
+        self.assertEqual(player["cash"], 495)
+
+    async def test_vehicle_rental_applies_damage_and_major_incident_ends_rental(self) -> None:
+        await self.database.ensure_player(502, "rental_damage", -100502)
+        await self.database.create_vehicle_rental(502, -100502, "bixi", "1h")
+
+        light_damage = await self.database.apply_vehicle_trip(
+            502, -100502, incident_roll=0.1, severity_roll=0.2
+        )
+        self.assertEqual(light_damage["status"], "light")
+        self.assertEqual(light_damage["damage_cost"], 4)
+        self.assertEqual(light_damage["deposit_remaining"], 11)
+        repair = await self.database.repair_vehicle_rental(502, -100502)
+        self.assertEqual((repair["status"], repair["fee"]), ("ok", 10))
+
+        major_damage = await self.database.apply_vehicle_trip(
+            502, -100502, incident_roll=0.1, severity_roll=0.95
+        )
+        self.assertEqual(major_damage["status"], "major")
+        self.assertEqual(major_damage["deposit_remaining"], 0)
+        self.assertIsNone(await self.database.get_vehicle_rental(502, -100502))
+
+    async def test_vehicle_rental_is_confiscated_when_repeated_repairs_spend_deposit(
+        self,
+    ) -> None:
+        await self.database.ensure_player(505, "rental_confiscation", -100505)
+        await self.database.create_vehicle_rental(505, -100505, "bixi", "1h")
+
+        result = {}
+        for _ in range(10):
+            result = await self.database.apply_vehicle_trip(
+                505, -100505, incident_roll=0.1, severity_roll=0.2
+            )
+            if result["status"] == "confiscated":
+                break
+            repair = await self.database.repair_vehicle_rental(505, -100505)
+            self.assertEqual(repair["status"], "ok")
+
+        self.assertEqual(result["status"], "confiscated")
+        self.assertEqual(result["deposit_remaining"], 0)
+        self.assertIsNone(await self.database.get_vehicle_rental(505, -100505))
+
+    async def test_vehicle_rentals_are_isolated_by_group_and_bank_funds(self) -> None:
+        await self.database.ensure_player(503, "rental_groups", -100503)
+        await self.database.ensure_player(503, "rental_groups", -100504)
+        async with aiosqlite.connect(self.database.path) as connection:
+            await connection.execute(
+                """
+                UPDATE players SET cash = 0, bank = 500
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (503, -100503),
+            )
+            await connection.commit()
+
+        first = await self.database.create_vehicle_rental(
+            503, -100503, "bixi", "1h"
+        )
+        second = await self.database.create_vehicle_rental(
+            503, -100504, "bixi", "1h"
+        )
+        self.assertEqual((first["status"], second["status"]), ("ok", "ok"))
+        first_player = await self.database.get_player(503, -100503)
+        second_player = await self.database.get_player(503, -100504)
+        self.assertEqual((first_player["cash"], first_player["bank"]), (0, 480))
+        self.assertEqual((second_player["cash"], second_player["bank"]), (480, 0))
+
+        returned = await self.database.return_vehicle_rental(503, -100503)
+        self.assertEqual(returned["bank_refund"], 15)
+        self.assertIsNotNone(await self.database.get_vehicle_rental(503, -100504))
+
+    async def test_expired_vehicle_rental_refunds_deposit(self) -> None:
+        await self.database.ensure_player(504, "rental_expired", -100504)
+        await self.database.create_vehicle_rental(504, -100504, "bixi", "1h")
+        async with aiosqlite.connect(self.database.path) as connection:
+            await connection.execute(
+                """
+                UPDATE vehicle_rentals SET expires_at = ?
+                WHERE user_id = ? AND chat_id = ? AND active = 1
+                """,
+                (time.time() - 1, 504, -100504),
+            )
+            await connection.commit()
+
+        rental = await self.database.get_vehicle_rental(504, -100504)
+        self.assertEqual(rental["status"], "expired")
+        self.assertEqual(rental["cash_refund"], 15)
+        self.assertIsNone(await self.database.get_vehicle_rental(504, -100504))
+        player = await self.database.get_player(504, -100504)
+        self.assertEqual(player["cash"], 495)
+
+    async def test_drive_requires_vehicle_and_clean_trip_rewards_cash_and_xp(self) -> None:
+        await self.database.ensure_player(506, "drive", -100506)
+        missing = await self.database.complete_vehicle_drive(
+            506, -100506, 0.99, 0.5, 0.99
+        )
+        self.assertEqual(missing["status"], "no_vehicle")
+
+        await self.database.purchase_item(506, "bixi", -100506)
+        result = await self.database.complete_vehicle_drive(
+            506, -100506, 0.99, 0.5, 0.99
+        )
+        self.assertEqual(result["status"], "clear")
+        self.assertEqual(result["cash_delta"], 75)
+        self.assertEqual(result["xp"], 20)
+        player = await self.database.get_player(506, -100506)
+        self.assertEqual((player["cash"], player["xp"], player["level"]), (525, 20, 1))
+
+        cooldown = await self.database.complete_vehicle_drive(
+            506, -100506, 0.99, 0.5, 0.99
+        )
+        self.assertEqual(cooldown["status"], "cooldown")
+
+    async def test_drive_rental_incident_requires_cash_repair_before_next_trip(self) -> None:
+        await self.database.ensure_player(507, "drive_rental", -100507)
+        await self.database.create_vehicle_rental(507, -100507, "bixi", "1h")
+        incident = await self.database.complete_vehicle_drive(
+            507, -100507, 0.1, 0.2, 0.99
+        )
+        self.assertEqual(incident["status"], "light")
+        self.assertEqual(incident["damage_cost"], 4)
+        self.assertEqual(incident["repair_fee"], 10)
+
+        blocked = await self.database.complete_vehicle_drive(
+            507, -100507, 0.99, 0.2, 0.99
+        )
+        self.assertEqual(blocked["status"], "repair_required")
+        self.assertEqual(blocked["fee"], 10)
+        rental = await self.database.get_vehicle_rental(507, -100507)
+        self.assertEqual(rental["repair_due"], 10)
+        repair = await self.database.repair_vehicle_rental(507, -100507)
+        self.assertEqual((repair["status"], repair["fee"]), ("ok", 10))
+        async with aiosqlite.connect(self.database.path) as connection:
+            await connection.execute(
+                """
+                UPDATE drive_cooldowns SET last_drive_at = ?
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (time.time() - 61, 507, -100507),
+            )
+            await connection.commit()
+        resumed = await self.database.complete_vehicle_drive(
+            507, -100507, 0.99, 0.2, 0.99
+        )
+        self.assertEqual(resumed["status"], "clear")
+        self.assertEqual(resumed["cash_delta"], 75)
+
     async def test_shop_equipment_bonuses_are_added_for_juggs(self) -> None:
         await self.database.ensure_player(405, "bonus_items")
         self.assertEqual(await self.database.purchase_item(405, "tech_fleece"), "ok")
@@ -586,6 +755,110 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(counter["fine"], 100)
         self.assertEqual((await self.database.get_player(505))["cash"], 1612)
         self.assertEqual((await self.database.get_player(606))["cash"], 388)
+
+    async def test_weapon_profile_uses_strongest_weapon_in_the_current_group(self) -> None:
+        await self.database.ensure_player(506, "weapon_profile", -100506)
+        await self.database.ensure_player(506, "weapon_profile", -100507)
+        await self.database.apply_action_result(
+            506, 20000, 0, None, None, chat_id=-100506
+        )
+        await self.database.apply_action_result(
+            506, 20000, 0, None, None, chat_id=-100507
+        )
+        self.assertEqual(
+            await self.database.purchase_item(506, "beretta_m9", -100506), "ok"
+        )
+        self.assertEqual(
+            await self.database.purchase_item(506, "ak_47", -100506), "ok"
+        )
+        self.assertEqual(
+            await self.database.purchase_item(506, "glock_19", -100507), "ok"
+        )
+
+        group_profile = await self.database.get_weapon_profile(506, -100506)
+        other_group_profile = await self.database.get_weapon_profile(506, -100507)
+        private_profile = await self.database.get_weapon_profile(506, 0)
+        self.assertEqual(
+            (group_profile["has_weapon"], group_profile["power"], group_profile["name"]),
+            (1, 3, "AK-47 — édition arcade"),
+        )
+        self.assertEqual(other_group_profile["power"], 1)
+        self.assertEqual(private_profile["power"], 0)
+
+    async def test_shootout_moves_only_cash_awards_xp_and_enforces_target_cooldown(
+        self,
+    ) -> None:
+        await self.database.ensure_player(507, "shooter", -100508)
+        await self.database.ensure_player(508, "target", -100508)
+        await self.database.move_bank_funds(507, -100508, 200, True)
+        await self.database.move_bank_funds(508, -100508, 200, True)
+        async with aiosqlite.connect(self.database.path) as connection:
+            await connection.execute(
+                """
+                UPDATE players SET cash = 1000
+                WHERE chat_id = ? AND user_id IN (?, ?)
+                """,
+                (-100508, 507, 508),
+            )
+            await connection.commit()
+
+        result = await self.database.apply_shootout_result(
+            507,
+            508,
+            507,
+            xp_gain=125,
+            police_intervention=True,
+            prison_until=time.time() + PRISON_DURATION_SECONDS,
+            chat_id=-100508,
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["cash_loss"], 250)
+        self.assertEqual(result["hospital_fee"], 100)
+        self.assertEqual(result["loot"], 150)
+        self.assertEqual(result["police_intervention"], 1)
+        shooter = await self.database.get_player(507, -100508)
+        target = await self.database.get_player(508, -100508)
+        self.assertEqual((shooter["cash"], shooter["bank"]), (1150, 200))
+        self.assertEqual((target["cash"], target["bank"]), (750, 200))
+        self.assertEqual(shooter["xp"], 125)
+        self.assertGreater(target["in_prison_until"], time.time())
+
+        blocked = await self.database.apply_shootout_result(
+            507,
+            508,
+            507,
+            xp_gain=125,
+            police_intervention=False,
+            prison_until=None,
+            chat_id=-100508,
+        )
+        self.assertEqual(blocked["status"], "cooldown")
+
+    async def test_shootout_cooldown_is_scoped_to_attacker_target_and_group(
+        self,
+    ) -> None:
+        await self.database.ensure_player(509, "shooter", -100509)
+        await self.database.ensure_player(510, "target", -100509)
+        await self.database.ensure_player(509, "shooter", -100510)
+        await self.database.ensure_player(510, "target", -100510)
+        await self.database.ensure_player(511, "other_target", -100509)
+
+        first = await self.database.apply_shootout_result(
+            509, 510, 509, 100, False, None, chat_id=-100509
+        )
+        same_target = await self.database.apply_shootout_result(
+            509, 510, 509, 100, False, None, chat_id=-100509
+        )
+        other_target = await self.database.apply_shootout_result(
+            509, 511, 509, 100, False, None, chat_id=-100509
+        )
+        other_group = await self.database.apply_shootout_result(
+            509, 510, 509, 100, False, None, chat_id=-100510
+        )
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual(same_target["status"], "cooldown")
+        self.assertEqual(other_target["status"], "ok")
+        self.assertEqual(other_group["status"], "ok")
 
     async def test_cash_transfer_moves_money_atomically(self) -> None:
         await self.database.ensure_player(1101, "sender", -1001)

@@ -94,70 +94,66 @@ JUGG_TIERS = (
 HUSTLES = (
     HustleSpec(
         "colis",
-        "Défi de livraison express (Plateau → St-Léonard)",
+        "Mission logistique urbaine",
         0.85,
         115,
         25,
         20,
         5,
-        "📦 Livraison arcade terminée: tu as validé les étapes du parcours "
-        "Plateau–St-Léonard. Le jeu crédite {cash}$ pour ce score.",
+        "📦 Parcours logistique validé. Récompense : {cash}$ et progression créditée.",
     ),
     HustleSpec(
         "phishing",
-        "Défi de sensibilisation SMS à Saint-Michel",
+        "Audit de sécurité numérique",
         0.70,
         275,
         30,
         25,
         10,
-        "📲 Simulation SMS Interac réussie: tu as repéré les signaux d'alerte "
-        "dans le scénario d'entraînement. Les points de la manche valent "
-        "{cash}$ dans le jeu.",
+        "📲 Audit complété. Les indicateurs du scénario ont été vérifiés; "
+        "récompense : {cash}$.",
     ),
     HustleSpec(
         "catalyseur",
-        "Défi mécanique de Civic",
+        "Contrôle technique automobile",
         0.60,
         475,
         35,
         30,
         15,
-        "🔧 Épreuve mécanique arcade terminée: tu as complété les contrôles "
-        "virtuels de la Civic dans le temps imparti. Récompense fixe: {cash}$.",
+        "🔧 Contrôle technique terminé dans le temps imparti. "
+        "Récompense : {cash}$.",
     ),
     HustleSpec(
         "vapote",
-        "Défi de kiosque au Cégep",
+        "Défi de service — kiosque",
         0.90,
         65,
         20,
         15,
         3,
-        "🧃 Défi de kiosque terminé au Cégep: tu as atteint l'objectif de "
-        "service du mini-jeu. Le score ajoute {cash}$ à ta caisse d'arcade.",
+        "🧃 Objectif de service atteint. Récompense : {cash}$.",
     ),
     HustleSpec(
         "depanneur",
-        "Défi chronométré au dépanneur",
+        "Gestion des stocks — dépanneur",
         0.50,
         900,
         50,
         30,
         25,
-        "🏪 Parcours chronométré du dépanneur complété dans le mini-jeu: "
-        "tous les checkpoints sont validés. Récompense fixe: {cash}$.",
+        "🏪 Parcours de gestion complété. Tous les objectifs sont validés; "
+        "récompense : {cash}$.",
     ),
     HustleSpec(
         "sneakers",
-        "Défi d'échange de baskets",
+        "Circuit de collection — sneakers",
         0.75,
         400,
         25,
         25,
         15,
-        "👟 Défi de collection terminé: tu as complété la tournée de baskets "
-        "dans le marché virtuel. Le score de la partie rapporte {cash}$.",
+        "👟 Défi de collection terminé. Récompense : {cash}$.",
     ),
 )
 
@@ -182,6 +178,14 @@ class PvpResult:
     fine: int = 0
     xp_gain: int = 0
     transfer_rate: float = 0.0
+
+
+@dataclass(frozen=True)
+class ShootoutResult:
+    winner: str
+    attacker_chance: float
+    police_intervention: bool
+    xp_gain: int
 
 
 ITEMS = (
@@ -970,6 +974,301 @@ ITEMS = (
     ShopItem("gps_jammer", "Brouilleur GPS", "matos", 8000, 35, success_bonus=0.04),
 )
 
+ITEMS += (
+    ShopItem(
+        "nike_air_max_tech",
+        "Nike Air Max — édition urbaine",
+        "pieds",
+        620,
+        8,
+        xp_bonus=5,
+        success_bonus=0.02,
+        description="Sneakers de collection au coloris exclusif; bonus appliqués uniquement dans l'arcade.",
+    ),
+    ShopItem(
+        "nike_crewneck",
+        "Nike Sportswear Crewneck",
+        "corps_vestes",
+        540,
+        6,
+        xp_bonus=5,
+        description="Chandail confortable au style sport classique; bonus d'XP en jeu.",
+    ),
+    ShopItem(
+        "adidas_forum_low",
+        "Adidas Forum Low",
+        "pieds",
+        480,
+        5,
+        xp_bonus=4,
+        description="Silhouette rétro et finition soignée pour compléter ta collection.",
+    ),
+    ShopItem(
+        "adidas_originals_hoodie",
+        "Adidas Originals Hoodie",
+        "corps_vestes",
+        650,
+        8,
+        xp_bonus=6,
+        success_bonus=0.01,
+        description="Hoodie Originals à la coupe classique; bonus réservés aux mécaniques du jeu.",
+    ),
+    ShopItem(
+        "prada_re_nylon_jacket",
+        "Prada Re-Nylon — veste",
+        "corps_vestes",
+        2600,
+        24,
+        xp_bonus=16,
+        success_bonus=0.03,
+        description="Veste premium au design épuré; pièce cosmétique avec bonus d'arcade.",
+    ),
+    ShopItem(
+        "prada_sport_cap",
+        "Prada Sport — casquette",
+        "tete_visage",
+        1250,
+        15,
+        xp_bonus=9,
+        success_bonus=0.02,
+        description="Casquette de collection, finition sobre et logo discret.",
+    ),
+    ShopItem(
+        "gucci_ace_sneakers",
+        "Gucci Ace — sneakers",
+        "pieds",
+        2200,
+        22,
+        xp_bonus=15,
+        success_bonus=0.03,
+        description="Sneakers premium pour une collection haut de gamme.",
+    ),
+    ShopItem(
+        "gucci_wool_scarf",
+        "Gucci — écharpe en laine",
+        "accessoires_sacoches",
+        1450,
+        18,
+        xp_bonus=11,
+        success_bonus=0.02,
+        description="Écharpe de collection adaptée aux hivers montréalais.",
+    ),
+    ShopItem(
+        "louis_vuitton_trainer",
+        "Louis Vuitton Trainer",
+        "pieds",
+        3900,
+        30,
+        xp_bonus=20,
+        success_bonus=0.04,
+        description="Sneakers de luxe au design distinctif; bonus limités à l'arcade.",
+    ),
+    ShopItem(
+        "louis_vuitton_card_holder",
+        "Louis Vuitton — porte-cartes",
+        "accessoires_sacoches",
+        1150,
+        15,
+        xp_bonus=9,
+        description="Petit accessoire de collection au fini premium.",
+    ),
+    ShopItem(
+        "lacoste_polo_classic",
+        "Lacoste — polo classique",
+        "vetement",
+        520,
+        6,
+        xp_bonus=5,
+        success_bonus=0.01,
+        description="Polo intemporel à porter en toute saison.",
+    ),
+    ShopItem(
+        "lacoste_croco_cap",
+        "Lacoste — casquette Croco",
+        "tete_visage",
+        350,
+        4,
+        xp_bonus=3,
+        description="Casquette légère, style sport et finition nette.",
+    ),
+    ShopItem(
+        "moncler_maya_vest",
+        "Moncler Maya — veste",
+        "corps_vestes",
+        3200,
+        28,
+        xp_bonus=19,
+        success_bonus=0.04,
+        description="Doudoune de collection pour les sorties par temps froid.",
+    ),
+    ShopItem(
+        "burberry_check_scarf",
+        "Burberry — écharpe à carreaux",
+        "accessoires_sacoches",
+        1700,
+        20,
+        xp_bonus=13,
+        success_bonus=0.02,
+        description="Écharpe classique au motif reconnaissable.",
+    ),
+    ShopItem(
+        "off_white_arrow_hoodie",
+        "Off-White — hoodie Arrow",
+        "corps_vestes",
+        2100,
+        22,
+        xp_bonus=15,
+        success_bonus=0.03,
+        description="Hoodie streetwear de collection, bonus utilisables dans le jeu.",
+    ),
+    ShopItem(
+        "balenciaga_runner",
+        "Balenciaga Runner",
+        "pieds",
+        2800,
+        26,
+        xp_bonus=17,
+        success_bonus=0.03,
+        description="Sneakers au profil affirmé pour les amateurs de silhouettes originales.",
+    ),
+    ShopItem(
+        "stone_island_overshirt",
+        "Stone Island — surchemise",
+        "corps_vestes",
+        1600,
+        18,
+        xp_bonus=12,
+        success_bonus=0.02,
+        description="Surchemise robuste au style minimaliste.",
+    ),
+    ShopItem(
+        "carhartt_wip_double_knee",
+        "Carhartt WIP — pantalon Double Knee",
+        "vetement",
+        460,
+        5,
+        xp_bonus=4,
+        description="Pantalon workwear solide au style décontracté.",
+    ),
+    ShopItem(
+        "palm_angels_bear_cap",
+        "Palm Angels — casquette Bear",
+        "tete_visage",
+        780,
+        11,
+        xp_bonus=7,
+        success_bonus=0.01,
+        description="Casquette streetwear de collection.",
+    ),
+    ShopItem(
+        "dior_oblique_sweater",
+        "Dior Oblique — chandail",
+        "vetement",
+        3600,
+        32,
+        xp_bonus=21,
+        success_bonus=0.04,
+        description="Pièce premium à intégrer à une collection haut de gamme.",
+    ),
+    ShopItem(
+        "versace_barocco_shirt",
+        "Versace — chemise Barocco",
+        "vetement",
+        2450,
+        25,
+        xp_bonus=16,
+        success_bonus=0.03,
+        description="Chemise de collection aux motifs audacieux.",
+    ),
+    ShopItem(
+        "new_balance_990v6",
+        "New Balance 990v6",
+        "pieds",
+        720,
+        9,
+        xp_bonus=6,
+        success_bonus=0.01,
+        description="Sneakers polyvalentes au confort reconnu.",
+    ),
+    ShopItem(
+        "supreme_box_logo_hoodie",
+        "Supreme — Box Logo Hoodie",
+        "corps_vestes",
+        1850,
+        20,
+        xp_bonus=14,
+        success_bonus=0.03,
+        description="Hoodie streetwear recherché par les collectionneurs.",
+    ),
+)
+
+ITEMS += (
+    ShopItem("chanel_classic_flap_bag", "Chanel Classic Flap — sac de collection", "accessoires_sacoches", 5200, 35, xp_bonus=22, success_bonus=0.04, description="Sac de collection matelassé; bonus réservés à l'arcade."),
+    ShopItem("chanel_tweed_jacket", "Chanel — veste tweed", "corps_vestes", 4800, 34, xp_bonus=22, description="Veste de collection au style intemporel."),
+    ShopItem("chanel_ballet_flats", "Chanel — ballerines", "pieds", 2450, 25, xp_bonus=16, description="Chaussures élégantes pour compléter ta collection."),
+    ShopItem("hermes_birkin_25", "Hermès Birkin 25 — sac de collection", "accessoires_sacoches", 12500, 42, xp_bonus=24, success_bonus=0.04, description="Pièce de maroquinerie de collection; bonus d'arcade."),
+    ShopItem("hermes_kelly_28", "Hermès Kelly 28 — sac de collection", "accessoires_sacoches", 11800, 40, xp_bonus=23, success_bonus=0.04, description="Sac de collection au format classique."),
+    ShopItem("hermes_silk_shirt", "Hermès — chemise en soie", "vetements_accessoires", 3200, 30, xp_bonus=18, success_bonus=0.03, description="Chemise de collection aux finitions soignées."),
+    ShopItem("jacquemus_le_chiquito", "Jacquemus Le Chiquito — sac", "accessoires_sacoches", 1250, 16, xp_bonus=10, description="Petit sac de collection au design graphique."),
+    ShopItem("jacquemus_la_robe", "Jacquemus — robe de collection", "vetements_accessoires", 1850, 20, xp_bonus=14, success_bonus=0.02, description="Robe de collection à la coupe contemporaine."),
+    ShopItem("jacquemus_le_cardigan", "Jacquemus — cardigan", "corps_vestes", 1400, 17, xp_bonus=11, description="Cardigan léger pour les tenues de saison."),
+    ShopItem("corteiz_allstarz_tee", "Corteiz Allstarz — t-shirt", "vetements_accessoires", 420, 5, xp_bonus=4, description="T-shirt streetwear de collection."),
+    ShopItem("corteiz_tracksuit", "Corteiz — ensemble tracksuit", "corps_vestes", 1150, 14, xp_bonus=9, success_bonus=0.02, description="Ensemble coordonné au style sportif."),
+    ShopItem("corteiz_cargos", "Corteiz — pantalon cargo", "vetements_accessoires", 680, 9, xp_bonus=6, description="Pantalon cargo ample au style décontracté."),
+    ShopItem("corteiz_4starz_sneakers", "Corteiz 4Starz — sneakers", "pieds", 890, 12, xp_bonus=8, success_bonus=0.01, description="Sneakers streetwear à ajouter à ta collection."),
+    ShopItem("nike_womens_tech_set", "Nike — ensemble Tech femme", "corps_vestes", 780, 10, xp_bonus=7, description="Ensemble sport à la coupe ajustée."),
+    ShopItem("nike_womens_dunk_low", "Nike Dunk Low — édition femme", "pieds", 610, 8, xp_bonus=5, description="Sneakers basses au coloris de collection."),
+    ShopItem("dior_saddle_bag", "Dior Saddle — sac de collection", "accessoires_sacoches", 4100, 32, xp_bonus=20, success_bonus=0.04, description="Maroquinerie de collection au profil iconique."),
+    ShopItem("dior_slingback_pumps", "Dior — escarpins Slingback", "pieds", 2250, 24, xp_bonus=15, description="Chaussures habillées pour les tenues de soirée."),
+    ShopItem("gucci_jackie_1961", "Gucci Jackie 1961 — sac de collection", "accessoires_sacoches", 3650, 30, xp_bonus=18, success_bonus=0.03, description="Sac de collection au fermoir signature."),
+    ShopItem("prada_cleo_bag", "Prada Cleo — sac de collection", "accessoires_sacoches", 3350, 29, xp_bonus=18, success_bonus=0.03, description="Sac de collection aux lignes épurées."),
+    ShopItem("balenciaga_le_cagole", "Balenciaga Le Cagole — sac", "accessoires_sacoches", 2950, 27, xp_bonus=17, description="Sac de collection au style affirmé."),
+    ShopItem("rolex_daytona", "Rolex Daytona — montre de collection", "accessoires_sacoches", 18000, 40, xp_bonus=25, success_bonus=0.05, description="Montre de collection; bonus d'arcade uniquement."),
+    ShopItem("audemars_royal_oak", "Audemars Piguet Royal Oak — montre", "accessoires_sacoches", 26000, 48, xp_bonus=28, success_bonus=0.05, description="Montre de collection haut de gamme."),
+    ShopItem("patek_nautilus", "Patek Philippe Nautilus — montre", "accessoires_sacoches", 32000, 52, xp_bonus=30, success_bonus=0.05, description="Montre de collection pour les hauts niveaux."),
+    ShopItem("cartier_santos", "Cartier Santos — montre", "accessoires_sacoches", 6200, 36, xp_bonus=21, success_bonus=0.04, description="Montre de collection au bracelet distinctif."),
+    ShopItem("chanel_pearl_earrings", "Chanel — boucles d'oreilles perles", "accessoires_sacoches", 980, 13, xp_bonus=8, description="Bijou de collection pour compléter une tenue."),
+    ShopItem("hermes_silk_scarf", "Hermès — carré de soie", "accessoires_sacoches", 760, 10, xp_bonus=6, description="Carré de soie aux motifs de collection."),
+    ShopItem("prada_sunglasses_archive", "Prada — lunettes de soleil archive", "tete_visage", 920, 13, xp_bonus=8, description="Lunettes de collection à monture géométrique."),
+    ShopItem("jacquemus_le_bambino", "Jacquemus Le Bambino — sac", "accessoires_sacoches", 1390, 17, xp_bonus=11, description="Petit sac à bandoulière de collection."),
+    ShopItem("moncler_womens_maya", "Moncler Maya — doudoune femme", "corps_vestes", 2800, 26, xp_bonus=17, success_bonus=0.03, description="Doudoune de collection à la coupe courte."),
+    ShopItem("lv_womens_sneaker", "Louis Vuitton — sneaker Archlight", "pieds", 3150, 28, xp_bonus=18, success_bonus=0.03, description="Sneaker de collection au profil sculptural."),
+)
+
+ITEMS += (
+    ShopItem("mercedes_amg_c63_s", "Mercedes-AMG C 63 S", "vehicules", 72000, 25, success_bonus=0.05, description="Berline sportive de collection, utilisable dans les activités compatibles du jeu."),
+    ShopItem("mercedes_amg_cla45", "Mercedes-AMG CLA 45", "vehicules", 58000, 20, success_bonus=0.04, description="Coupé quatre portes compact au style sportif."),
+    ShopItem("bmw_m4_competition", "BMW M4 Competition", "vehicules", 82000, 28, success_bonus=0.05, description="Coupé sportif pour la collection automobile."),
+    ShopItem("bmw_x6m_competition", "BMW X6 M Competition", "vehicules", 105000, 34, success_bonus=0.06, description="SUV hautes performances au profil distinctif."),
+    ShopItem("audi_rs6_avant", "Audi RS 6 Avant", "vehicules", 98000, 32, success_bonus=0.06, description="Wagon sportif polyvalent pour les déplacements en jeu."),
+    ShopItem("audi_rsq8", "Audi RS Q8", "vehicules", 112000, 36, success_bonus=0.06, description="SUV de collection à la finition premium."),
+    ShopItem("porsche_911_gt3_rs", "Porsche 911 GT3 RS", "vehicules", 230000, 48, success_bonus=0.07, description="Modèle sportif de prestige pour les collectionneurs."),
+    ShopItem("porsche_cayenne_turbo", "Porsche Cayenne Turbo", "vehicules", 118000, 38, success_bonus=0.06, description="SUV de luxe à ajouter au garage."),
+    ShopItem("lamborghini_urus_se", "Lamborghini Urus", "vehicules", 240000, 50, success_bonus=0.08, description="SUV de prestige pour les activités compatibles du jeu."),
+    ShopItem("lamborghini_huracan", "Lamborghini Huracán", "vehicules", 285000, 52, success_bonus=0.08, description="Supercar de collection à la silhouette iconique."),
+    ShopItem("ferrari_f8_tributo", "Ferrari F8 Tributo", "vehicules", 310000, 54, success_bonus=0.08, description="Supercar de prestige pour les hauts niveaux."),
+    ShopItem("rolls_royce_cullinan", "Rolls-Royce Cullinan", "vehicules", 350000, 56, success_bonus=0.08, description="SUV de luxe aux finitions haut de gamme."),
+    ShopItem("rolls_royce_ghost", "Rolls-Royce Ghost", "vehicules", 330000, 55, success_bonus=0.08, description="Berline grand luxe pour les collectionneurs."),
+    ShopItem("range_rover_autobiography", "Range Rover Autobiography", "vehicules", 145000, 42, success_bonus=0.07, description="SUV de prestige au confort généreux."),
+    ShopItem("brabus_800_g63", "Brabus 800 — G 63", "vehicules", 265000, 52, success_bonus=0.08, description="SUV de collection à la configuration exclusive."),
+)
+
+VEHICLE_RENTAL_TERMS = {
+    "1h": ("1 heure", 3600, 10, 30),
+    "24h": ("24 heures", 86400, 25, 50),
+    "7d": ("7 jours", 604800, 50, 75),
+}
+
+
+def vehicle_rental_quote(item: ShopItem, duration: str) -> tuple[int, int]:
+    """Return the fixed game rental fee and refundable deposit."""
+    term = VEHICLE_RENTAL_TERMS.get(duration)
+    if item.category != "vehicules" or term is None:
+        raise ValueError("Durée ou véhicule de location non valide.")
+    _, _, rent_percent, deposit_percent = term
+    return item.price * rent_percent // 100, item.price * deposit_percent // 100
+
+
 SHOP_CATEGORIES = {
     "vetements_accessoires": "Vêtements & Accessoires",
     "tete_visage": "Vêtements & Accessoires — Tête & Visage",
@@ -1117,6 +1416,8 @@ def resolve_pvp(
     counter_roll: float | None = None,
     transfer_roll: float | None = None,
     victim_has_armor: bool = False,
+    attacker_weapon_power: int | None = None,
+    victim_weapon_power: int | None = None,
 ) -> PvpResult:
     """Resolve a fictional, non-violent player-versus-player contest."""
     attack = random.random() if attack_roll is None else attack_roll
@@ -1125,7 +1426,21 @@ def resolve_pvp(
     if not all(0 <= roll < 1 for roll in (attack, counter, transfer)):
         raise ValueError("Les tirages doivent être compris entre 0 inclus et 1 exclu")
 
-    counter_chance = 0.60 if victim_has_weapon else 0.35 if victim_has_armor else 0.0
+    attacker_power = (
+        max(0, attacker_weapon_power)
+        if attacker_weapon_power is not None
+        else 1 if attacker_has_weapon else 0
+    )
+    victim_power = (
+        max(0, victim_weapon_power)
+        if victim_weapon_power is not None
+        else 1 if victim_has_weapon else 0
+    )
+    counter_chance = (
+        min(0.82, 0.60 + 0.08 * (victim_power - 1))
+        if victim_power
+        else 0.35 if victim_has_armor else 0.0
+    )
     if counter < counter_chance:
         return PvpResult(
             "counter",
@@ -1134,19 +1449,67 @@ def resolve_pvp(
             prison_seconds=PRISON_DURATION_SECONDS,
             fine=500,
         )
-    success_chance = 0.50 + (0.15 if attacker_has_weapon else 0.0)
+    if attacker_weapon_power is None and victim_weapon_power is None:
+        success_chance = 0.50 + (0.15 if attacker_has_weapon else 0.0)
+    else:
+        success_chance = min(
+            0.88,
+            max(
+                0.25,
+                0.50
+                + 0.10 * attacker_power
+                - 0.06 * victim_power
+                + (0.05 if attacker_power else 0.0),
+            ),
+        )
     if attack < success_chance:
+        if attacker_weapon_power is None:
+            transfer_rate = 0.15 + 0.20 * transfer
+        else:
+            transfer_rate = min(
+                0.50, 0.12 + 0.06 * attacker_power + 0.20 * transfer
+            )
         return PvpResult(
             "success",
             "Défi PVP remporté dans le jeu: le transfert de kob est appliqué.",
             xp_gain=70,
-            transfer_rate=0.15 + 0.20 * transfer,
+            transfer_rate=transfer_rate,
         )
     return PvpResult(
         "failed",
         "Le braquage fictif échoue; les condés interviennent. "
         "Aucun cash n'est transféré.",
         prison_seconds=PRISON_DURATION_SECONDS,
+    )
+
+
+def resolve_shootout(
+    attacker_weapon_power: int,
+    victim_weapon_power: int,
+    outcome_roll: float | None = None,
+    police_roll: float | None = None,
+) -> ShootoutResult:
+    """Resolve an abstract arcade duel using inventory power ratings."""
+    if attacker_weapon_power < 1 or victim_weapon_power < 0:
+        raise ValueError("Puissance d'arme non valide.")
+    outcome = random.random() if outcome_roll is None else outcome_roll
+    police = random.random() if police_roll is None else police_roll
+    if not 0 <= outcome < 1 or not 0 <= police < 1:
+        raise ValueError("Les tirages doivent être compris entre 0 inclus et 1 exclu.")
+
+    attacker_chance = min(
+        0.90,
+        max(0.20, 0.55 + 0.12 * (attacker_weapon_power - victim_weapon_power)),
+    )
+    winner = "attacker" if outcome < attacker_chance else "victim"
+    winning_power = (
+        attacker_weapon_power if winner == "attacker" else victim_weapon_power
+    )
+    return ShootoutResult(
+        winner=winner,
+        attacker_chance=attacker_chance,
+        police_intervention=police < 0.22,
+        xp_gain=100 + 25 * winning_power,
     )
 
 

@@ -16,6 +16,7 @@ from bot import (
     bank,
     casino,
     deposit,
+    drive,
     edit_callback_message,
     help_command,
     handle_game_action,
@@ -37,7 +38,10 @@ from bot import (
     mission_depanneur,
     mission_sneakers,
     prison_remaining_seconds,
+    shop,
     shop_callback,
+    shoot,
+    vehicle_rental_callback,
     start,
     withdraw,
 )
@@ -126,7 +130,12 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
             "/jugg",
             "/juggling",
             "/braquer",
+            "/shoot",
             "/shop",
+            "/drive",
+            "/ride",
+            "/repair",
+            "/return",
             "/prison",
             "/evade",
             "/inventory",
@@ -166,7 +175,12 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
                 "jugg",
                 "juggling",
                 "braquer",
+                "shoot",
                 "shop",
+                "drive",
+                "ride",
+                "repair",
+                "return",
                 "prison",
                 "inventory",
                 "top",
@@ -229,7 +243,11 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
                 for handler in handlers
             )
         )
-        for command in ("bank", "deposit", "withdraw", "hustle"):
+        for command in (
+            "bank", "deposit", "withdraw", "hustle", "drive", "ride", "repair",
+            "return",
+            "shoot",
+        ):
             self.assertTrue(
                 any(
                     isinstance(handler, CommandHandler)
@@ -396,6 +414,208 @@ class GiveCommandTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ShopCallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_vehicle_rental_shop_flow_charges_and_persists_rental(self) -> None:
+        temp_dir = TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        database = Database(str(Path(temp_dir.name) / "rental_shop.sqlite3"))
+        await database.initialize()
+        await database.ensure_player(101, "joueur", -1001)
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database})
+        )
+        message = SimpleNamespace(reply_text=AsyncMock(), sender_chat=None)
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=101, username="joueur", full_name="Joueur", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
+            effective_message=message,
+        )
+        query = AsyncMock(data="shop:101:section:gamos")
+        update.callback_query = query
+        await shop_callback(update, context)
+
+        buttons = [
+            button.callback_data
+            for row in query.edit_message_text.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            for button in row
+        ]
+        self.assertIn("shop:101:rentcatalog:vehicules", buttons)
+
+        query.data = "shop:101:rentcatalog:vehicules"
+        await shop_callback(update, context)
+        buttons = [
+            button.callback_data
+            for row in query.edit_message_text.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            for button in row
+        ]
+        self.assertIn("shop:101:rentcar:bixi", buttons)
+
+        query.data = "shop:101:rentcar:bixi"
+        await shop_callback(update, context)
+        buttons = [
+            button.callback_data
+            for row in query.edit_message_text.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            for button in row
+        ]
+        self.assertIn("rent:101:bixi:1h", buttons)
+
+        query.data = "rent:101:bixi:1h"
+        await vehicle_rental_callback(update, context)
+        self.assertIn("Location confirmée", query.edit_message_text.await_args.args[0])
+        rental = await database.get_vehicle_rental(101, -1001)
+        self.assertEqual(rental["item_id"], "bixi")
+        self.assertEqual((await database.get_player(101, -1001))["cash"], 480)
+
+    async def test_owned_vehicle_can_be_used_without_rental_risk(self) -> None:
+        temp_dir = TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        database = Database(str(Path(temp_dir.name) / "owned_vehicle.sqlite3"))
+        await database.initialize()
+        await database.ensure_player(102, "owner", -1002)
+        self.assertEqual(await database.purchase_item(102, "bixi", -1002), "ok")
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database})
+        )
+        message = SimpleNamespace(reply_text=AsyncMock(), sender_chat=None)
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=102, username="owner", full_name="Owner", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(id=-1002, type="supergroup"),
+            effective_message=message,
+        )
+
+        with patch("bot.random.SystemRandom") as system_random:
+            system_random.return_value.random.return_value = 0.99
+            await drive(update, context)
+
+        text = message.reply_text.await_args.args[0]
+        self.assertIn("véhicule de propriété", text)
+        self.assertIn("+75$", text)
+        self.assertIn("+20 XP", text)
+        player = await database.get_player(102, -1002)
+        self.assertEqual((player["cash"], player["xp"]), (525, 20))
+        self.assertIsNone(await database.get_vehicle_rental(102, -1002))
+
+    async def test_shop_navigation_brands_types_back_buttons_and_purchase(self) -> None:
+        temp_dir = TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        database = Database(str(Path(temp_dir.name) / "shop.sqlite3"))
+        await database.initialize()
+        await database.ensure_player(101, "joueur", -1001)
+        async with database.transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE players SET cash = 10000, level = 60
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (101, -1001),
+            )
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database})
+        )
+        message = SimpleNamespace(reply_text=AsyncMock(), sender_chat=None)
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=101, username="joueur", full_name="Joueur", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
+            effective_message=message,
+        )
+
+        await shop(update, context)
+        root_markup = message.reply_text.await_args.kwargs["reply_markup"]
+        root_callbacks = [
+            button.callback_data
+            for row in root_markup.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("shop:101:section:sapes", root_callbacks)
+        self.assertIn("shop:101:section:arsenal", root_callbacks)
+        self.assertIn("shop:101:section:gamos", root_callbacks)
+        self.assertIn("shop:101:section:equipment", root_callbacks)
+
+        query = AsyncMock(data="shop:101:section:sapes")
+        update.callback_query = query
+        await shop_callback(update, context)
+        brand_buttons = [
+            button
+            for row in query.edit_message_text.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            for button in row
+        ]
+        brand_callbacks = [button.callback_data for button in brand_buttons]
+        self.assertIn("shop:101:brand:nike", brand_callbacks)
+        self.assertIn("shop:101:brand:prada", brand_callbacks)
+        self.assertIn("shop:101:home", brand_callbacks)
+
+        query.data = "shop:101:brand:nike"
+        await shop_callback(update, context)
+        type_buttons = [
+            button
+            for row in query.edit_message_text.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            for button in row
+        ]
+        type_callbacks = [button.callback_data for button in type_buttons]
+        self.assertIn("shop:101:type:nike:footwear", type_callbacks)
+        self.assertIn("shop:101:section:sapes", type_callbacks)
+
+        query.data = "shop:101:type:nike:footwear"
+        await shop_callback(update, context)
+        text = query.edit_message_text.await_args.args[0]
+        self.assertIn("Nike Air Max", text)
+        item_buttons = [
+            button
+            for row in query.edit_message_text.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            for button in row
+        ]
+        item_callbacks = [button.callback_data for button in item_buttons]
+        self.assertIn("buy:101:nike_air_max_tech", item_callbacks)
+        self.assertIn("shop:101:brand:nike", item_callbacks)
+
+        query.data = "buy:101:nike_air_max_tech"
+        await shop_callback(update, context)
+        inventory = await database.get_inventory(101, -1001)
+        self.assertEqual(
+            [item["item_id"] for item in inventory],
+            ["nike_air_max_tech"],
+        )
+        buy_buttons = [
+            button
+            for row in query.edit_message_text.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            for button in row
+        ]
+        self.assertIn(
+            "shop:101:type:nike:footwear",
+            [button.callback_data for button in buy_buttons],
+        )
+
+    def test_expanded_fashion_catalog_has_unique_ids_and_preserves_game_rates(self) -> None:
+        from bot import SHOP_CLOTHING_CATEGORIES
+        from game import ITEMS
+
+        ids = [item.item_id for item in ITEMS]
+        self.assertEqual(len(ids), len(set(ids)))
+        fashion = [
+            item for item in ITEMS if item.category in SHOP_CLOTHING_CATEGORIES
+        ]
+        self.assertGreaterEqual(len(fashion), 75)
+        self.assertTrue(all(item.xp_bonus >= 0 for item in fashion))
+
     async def test_clothing_category_shows_item_descriptions_and_buy_buttons(self) -> None:
         database = AsyncMock()
         database.get_player.return_value = {"level": 1, "cash": 500}
@@ -929,8 +1149,8 @@ class MissionTests(unittest.IsolatedAsyncioTestCase):
         await missions(update, context)
 
         text = message.reply_text.await_args.args[0]
-        self.assertIn("Vol de civic rouillée", text)
-        self.assertIn("Carjacking d'une Audi", text)
+        self.assertIn("Mission logistique urbaine", text)
+        self.assertIn("Coordination de flotte", text)
         self.assertIn("niv. 10", text)
         self.assertIn("🔒 Verrouillée", text)
         self.assertIn("✅ Disponible", text)
@@ -1021,6 +1241,8 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
         )
         if register:
             await database.ensure_player(888, "hustle_player", chat.id)
+            if "colis" in args:
+                await database.purchase_item(888, "bixi", chat.id)
         return temp_dir, database, context, update, message, chat
 
     async def test_dedicated_hustle_commands_dispatch_the_matching_mission(self) -> None:
@@ -1051,6 +1273,17 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/mission_phishing", text)
         self.assertIn("Cooldown: 20s", text)
         self.assertIn("Gain fixe: 115$ | XP: 5", text)
+        self.assertIn("véhicule requis", text)
+
+    async def test_delivery_hustle_requires_a_vehicle(self) -> None:
+        temp_dir, _, context, update, message, _ = await self._setup_hustle([])
+        self.addCleanup(temp_dir.cleanup)
+        context.args = ["colis"]
+
+        await missions(update, context)
+
+        self.assertIn("T’es à pied", message.reply_text.await_args.args[0])
+
 
     async def test_hustle_pays_fixed_reward_and_enforces_global_cooldown(self) -> None:
         temp_dir, database, context, update, message, chat = await self._setup_hustle(
@@ -1063,7 +1296,7 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
             patch("bot.random.randint", side_effect=AssertionError("cash must be fixed")),
         ):
             await missions(update, context)
-            self.assertEqual(await database.get_player_balance(888, chat.id), 615)
+            self.assertEqual(await database.get_player_balance(888, chat.id), 565)
 
             message.reply_text.reset_mock()
             context.args = ["vapote"]
@@ -1073,7 +1306,7 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
             message.reply_text.await_args.args[0],
             r"Réessaie dans \d+ secondes\.",
         )
-        self.assertEqual(await database.get_player_balance(888, chat.id), 615)
+        self.assertEqual(await database.get_player_balance(888, chat.id), 565)
 
     async def test_failed_hustle_can_lose_cash_and_increase_heat(self) -> None:
         temp_dir, database, context, update, message, chat = await self._setup_hustle(
@@ -1148,6 +1381,7 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(temp_dir.cleanup)
 
         await database.ensure_player(chat.id, "Admin anonyme", chat.id)
+        await database.purchase_item(chat.id, "bixi", chat.id)
         message.sender_chat = SimpleNamespace(id=chat.id, title="Admin anonyme")
         update.effective_user = None
         context.args = []
@@ -1158,8 +1392,8 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
             await mission_colis(update, context)
 
         player = await database.get_player(chat.id, chat.id)
-        self.assertEqual(player["cash"], 615)
-        self.assertIn("Défi de livraison express", message.reply_text.await_args.args[0])
+        self.assertEqual(player["cash"], 565)
+        self.assertIn("Mission logistique urbaine", message.reply_text.await_args.args[0])
 
     async def test_hustle_handlers_require_start_for_unregistered_player(self) -> None:
         temp_dir, _, context, update, message, _ = await self._setup_hustle(
@@ -1248,6 +1482,127 @@ class BraquerChatTypeTests(unittest.IsolatedAsyncioTestCase):
                 reply_text.assert_awaited_once_with(
                     "Le défi PVP est verrouillé jusqu'au niveau 20."
                 )
+
+
+class ShootCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shoot_requires_inventory_weapon(self) -> None:
+        temp_dir = TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        database = Database(str(Path(temp_dir.name) / "shoot_unarmed.sqlite3"))
+        await database.initialize()
+        await database.ensure_player(701, "attacker", -100701)
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database}),
+            args=["@victim"],
+        )
+        message = SimpleNamespace(reply_text=AsyncMock(), sender_chat=None)
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=701, username="attacker", full_name="Attaquant", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(id=-100701, type="supergroup"),
+            effective_message=message,
+        )
+
+        await shoot(update, context)
+
+        self.assertIn("Il te faut une arme", message.reply_text.await_args.args[0])
+
+    async def test_shoot_resolves_armed_riposte_and_applies_cash_xp_and_cooldown(
+        self,
+    ) -> None:
+        temp_dir = TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        database = Database(str(Path(temp_dir.name) / "shoot.sqlite3"))
+        await database.initialize()
+        await database.ensure_player(702, "attacker", -100702)
+        await database.ensure_player(703, "victim", -100702)
+        await database.apply_action_result(
+            702, 20000, 0, None, None, chat_id=-100702
+        )
+        await database.apply_action_result(
+            703, 20000, 0, None, None, chat_id=-100702
+        )
+        await database.purchase_item(702, "glock_19", -100702)
+        await database.purchase_item(703, "ak_47", -100702)
+        async with database.transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE players SET cash = 10000, bank = 5000
+                WHERE chat_id = ? AND user_id IN (?, ?)
+                """,
+                (-100702, 702, 703),
+            )
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database}),
+            args=["@victim"],
+        )
+        message = SimpleNamespace(reply_text=AsyncMock(), sender_chat=None)
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=702, username="attacker", full_name="Attaquant", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(id=-100702, type="supergroup"),
+            effective_message=message,
+        )
+
+        with patch("game.random.random", side_effect=[0.99, 0.99]):
+            await shoot(update, context)
+
+        text = message.reply_text.await_args.args[0]
+        self.assertIn("riposte", text)
+        self.assertIn("victim prend l’avantage", text)
+        self.assertIn("cash liquide", text)
+        self.assertIn("récupère", text)
+        attacker = await database.get_player(702, -100702)
+        victim = await database.get_player(703, -100702)
+        self.assertEqual(attacker["cash"], 7500)
+        self.assertEqual(victim["cash"], 12400)
+        self.assertEqual((attacker["bank"], victim["bank"]), (5000, 5000))
+        self.assertEqual(victim["xp"], 176)
+
+        message.reply_text.reset_mock()
+        with patch("game.random.random", side_effect=[0.0, 0.99]):
+            await shoot(update, context)
+        self.assertIn("Attends encore", message.reply_text.await_args.args[0])
+        self.assertEqual((await database.get_player(703, -100702))["xp"], 176)
+
+    async def test_shoot_supports_targeting_a_replied_to_user(self) -> None:
+        temp_dir = TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        database = Database(str(Path(temp_dir.name) / "shoot_reply.sqlite3"))
+        await database.initialize()
+        await database.ensure_player(704, "attacker", -100704)
+        await database.ensure_player(705, "victim", -100704)
+        await database.apply_action_result(
+            704, 2000, 0, None, None, chat_id=-100704
+        )
+        await database.purchase_item(704, "beretta_m9", -100704)
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database}),
+            args=[],
+        )
+        message = SimpleNamespace(
+            reply_text=AsyncMock(),
+            sender_chat=None,
+            reply_to_message=SimpleNamespace(
+                from_user=SimpleNamespace(
+                    id=705, username="victim", full_name="Cible", is_bot=False
+                )
+            ),
+        )
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=704, username="attacker", full_name="Attaquant", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(id=-100704, type="supergroup"),
+            effective_message=message,
+        )
+
+        with patch("game.random.random", side_effect=[0.0, 0.99]):
+            await shoot(update, context)
+
+        self.assertIn("Attaquant prend l’avantage", message.reply_text.await_args.args[0])
 
 
 class JuggCallbackTests(unittest.IsolatedAsyncioTestCase):
