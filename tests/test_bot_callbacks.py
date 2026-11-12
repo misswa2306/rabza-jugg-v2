@@ -1,4 +1,6 @@
 from datetime import datetime, timezone
+import importlib
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -22,6 +24,7 @@ from bot import (
     devmode,
     drive,
     edit_callback_message,
+    error_handler,
     give_cash,
     give_item,
     give_xp,
@@ -34,17 +37,15 @@ from bot import (
     casino_command,
     profil,
     give_command,
-    give_infinite,
+    revoke_cash,
+    revoke_xp,
+    revoke_level,
+    revoke_item,
+    invest,
     handle_jugg_tier,
     handle_bank_callback,
     main as bot_main,
     jugg,
-    mission_colis,
-    mission_phishing,
-    mission_catalyseur,
-    mission_vapote,
-    mission_depanneur,
-    mission_sneakers,
     prison_remaining_seconds,
     shop,
     shop_callback,
@@ -54,11 +55,26 @@ from bot import (
     start,
     withdraw,
 )
+import config as config_module
 from config import ADMIN_USER_IDS, validate_config
-from database import MAX_ADMIN_XP, Database
+from database import MAX_ADMIN_BALANCE, MAX_ADMIN_XP, Database
 
 
 class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unexpected_handler_errors_are_logged_and_reported(self) -> None:
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = Update(update_id=1, message=message)
+        error = RuntimeError("sqlite unavailable")
+        context = SimpleNamespace(error=error)
+
+        with self.assertLogs("bot", level="ERROR") as captured:
+            await error_handler(update, context)
+
+        self.assertIn("Erreur inattendue", captured.output[0])
+        message.reply_text.assert_awaited_once_with(
+            "Oups, le bot a eu un pépin. Réessaie dans un instant."
+        )
+
     async def test_start_uses_montreal_welcome_and_escapes_player_name(self) -> None:
         database = AsyncMock()
         context = SimpleNamespace(
@@ -193,21 +209,12 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
             "/casino",
             "/missions",
             "/mission",
-            "/hustle",
-            "/mission_colis",
-            "/mission_phishing",
-            "/mission_catalyseur",
-            "/mission_vapote",
-            "/mission_depanneur",
-            "/mission_sneakers",
             "/help",
             "/jugg",
-            "/juggling",
             "/braquer",
             "/shoot",
             "/shop",
             "/drive",
-            "/ride",
             "/repair",
             "/return",
             "/prison",
@@ -220,11 +227,32 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
             "/give_xp",
             "/set_level",
             "/give_item",
-            "/give_infinite",
             "/admin_reset",
+            "/revoke_cash",
+            "/revoke_xp",
+            "/revoke_level",
+            "/revoke_item",
+            "/invest",
         ):
             with self.subTest(command=command):
                 self.assertIn(command, text)
+        for alias in (
+            "/bourse",
+            "/buy",
+            "/sell",
+            "/ride",
+            "/juggling",
+            "/hustle",
+            "/mission_colis",
+            "/mission_phishing",
+            "/mission_catalyseur",
+            "/mission_vapote",
+            "/mission_depanneur",
+            "/mission_sneakers",
+            "/give_infinite",
+        ):
+            with self.subTest(alias=alias):
+                self.assertNotIn(alias, text)
 
     def test_command_handlers_accept_plain_and_bot_mentioned_commands(self) -> None:
         bot = Bot("123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
@@ -246,29 +274,24 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
                 "casino",
                 "missions",
                 "mission",
-                "hustle",
-                "mission_colis",
-                "mission_phishing",
-                "mission_catalyseur",
-                "mission_vapote",
-                "mission_depanneur",
-                "mission_sneakers",
                 "admin",
                 "devmode",
                 "give_cash",
                 "give_xp",
                 "set_level",
                 "give_item",
-                "give_infinite",
                 "admin_reset",
+                "revoke_cash",
+                "revoke_xp",
+                "revoke_level",
+                "revoke_item",
+                "invest",
                 "help",
                 "jugg",
-                "juggling",
                 "braquer",
                 "shoot",
                 "shop",
                 "drive",
-                "ride",
                 "repair",
                 "return",
                 "prison",
@@ -312,6 +335,7 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
         builder = MagicMock()
         builder.token.return_value = builder
         builder.post_init.return_value = builder
+        builder.post_shutdown.return_value = builder
         builder.build.return_value = application
 
         with (
@@ -327,15 +351,9 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
                 for handler in handlers
             )
         )
-        self.assertTrue(
-            any(
-                isinstance(handler, CommandHandler) and "juggling" in handler.commands
-                for handler in handlers
-            )
-        )
         for command in (
-            "bank", "deposit", "withdraw", "hustle", "drive", "ride", "repair",
-            "return", "shoot", "admin", "give_infinite", "admin_reset",
+            "bank", "deposit", "withdraw", "drive", "repair",
+            "return", "shoot", "admin", "admin_reset",
             "devmode", "give_cash", "give_xp", "set_level", "give_item",
         ):
             self.assertTrue(
@@ -345,6 +363,20 @@ class HelpCommandTests(unittest.IsolatedAsyncioTestCase):
                     for handler in handlers
                 )
             )
+        registered_commands = {
+            command
+            for handler in handlers
+            if isinstance(handler, CommandHandler)
+            for command in handler.commands
+        }
+        self.assertNotIn("bourse", registered_commands)
+        self.assertNotIn("buy", registered_commands)
+        self.assertNotIn("sell", registered_commands)
+        self.assertNotIn("ride", registered_commands)
+        self.assertNotIn("juggling", registered_commands)
+        self.assertNotIn("hustle", registered_commands)
+        self.assertNotIn("mission_colis", registered_commands)
+        self.assertNotIn("give_infinite", registered_commands)
         self.assertTrue(
             any(
                 isinstance(handler, CallbackQueryHandler)
@@ -550,14 +582,17 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
             await admin(update, context)
-            await give_infinite(update, context)
-            await admin_reset(update, context)
             await give_cash(update, context)
+            await admin_reset(update, context)
             await give_xp(update, context)
             await set_level(update, context)
             await give_item(update, context)
+            await revoke_cash(update, context)
+            await revoke_xp(update, context)
+            await revoke_level(update, context)
+            await revoke_item(update, context)
 
-        self.assertEqual(message.reply_text.await_count, 7)
+        self.assertEqual(message.reply_text.await_count, 10)
         self.assertTrue(
             all(
                 "Passe ton chemin" in call.args[0]
@@ -621,13 +656,14 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             }
             self.assertEqual(
                 actions,
-                {"toggle", "credit", "xp", "level", "item", "repair", "reset"},
+                {"toggle", "credit", "xp", "level", "item", "revoke", "repair", "reset"},
             )
             for action, command in (
                 ("credit", "/give_cash"),
                 ("xp", "/give_xp"),
                 ("level", "/set_level"),
                 ("item", "/give_item"),
+                ("revoke", "/revoke_cash"),
                 ("repair", "/admin_reset"),
                 ("reset", "/admin_reset"),
             ):
@@ -718,6 +754,55 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("audi_rs3_nardo", {item["item_id"] for item in inventory})
             self.assertIn("audi_rs6_avant", {item["item_id"] for item in inventory})
             self.assertEqual(message.reply_text.await_count, 13)
+
+    async def test_dev_mode_revocation_commands_remove_exact_or_clear_values(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            database = Database(str(Path(temp_dir) / "admin_revoke.sqlite3"))
+            await database.initialize()
+            await database.ensure_player(self.ADMIN_ID, "admin", self.GROUP_ID)
+            await database.ensure_player(205, "recipient", self.GROUP_ID)
+            await database.ensure_player(205, "recipient", self.GROUP_ID - 1)
+            await database.toggle_admin_dev_mode(self.ADMIN_ID)
+            async with database.transaction() as connection:
+                await connection.execute(
+                    """
+                    UPDATE players SET cash = 1000, bank = 500, xp = 20000, level = 20
+                    WHERE user_id = ? AND chat_id = ?
+                    """,
+                    (205, self.GROUP_ID),
+                )
+            await database.admin_give_item(205, self.GROUP_ID, "bixi")
+            await database.admin_give_item(205, self.GROUP_ID, "bixi")
+            context = self._context(database, ["@recipient", "150", "bank"])
+            message = SimpleNamespace(reply_text=AsyncMock(), reply_to_message=None)
+            update = self._update(self.ADMIN_ID, message)
+
+            with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+                await revoke_cash(update, context)
+                context.args = ["@recipient", "5000"]
+                await revoke_xp(update, context)
+                context.args = ["@recipient", "3"]
+                await revoke_level(update, context)
+                context.args = ["@recipient", "bixi"]
+                await revoke_item(update, context)
+
+                context.args = ["@recipient"]
+                await revoke_cash(update, context)
+                await revoke_xp(update, context)
+                await revoke_level(update, context)
+                await revoke_item(update, context)
+
+            player = await database.get_player(205, self.GROUP_ID)
+            other_group_player = await database.get_player(205, self.GROUP_ID - 1)
+            self.assertEqual((player["cash"], player["bank"]), (0, 350))
+            self.assertEqual((player["xp"], player["level"]), (0, 1))
+            self.assertEqual(await database.get_inventory(205, self.GROUP_ID), [])
+            self.assertEqual(
+                (other_group_player["cash"], other_group_player["bank"],
+                 other_group_player["xp"], other_group_player["level"]),
+                (500, 0, 0, 1),
+            )
+            self.assertEqual(message.reply_text.await_count, 8)
 
     async def test_god_mode_ignores_existing_prison_on_mission_and_player_mode_does_not(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -864,14 +949,13 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             update = self._update(self.ADMIN_ID, message)
 
             with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
-                await give_infinite(update, context)
-                await admin_reset(update, context)
                 await give_cash(update, context)
+                await admin_reset(update, context)
                 await give_xp(update, context)
                 await set_level(update, context)
                 await give_item(update, context)
 
-            self.assertEqual(message.reply_text.await_count, 6)
+            self.assertEqual(message.reply_text.await_count, 5)
             self.assertTrue(
                 all(
                     "verrouillé en Mode Joueur" in call.args[0]
@@ -896,7 +980,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             context = self._context(database, ["@recipient", "100000", "bank"])
 
             with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
-                await give_infinite(update, context)
+                await give_cash(update, context)
 
             player = await database.get_player(202, self.GROUP_ID)
             other_group_player = await database.get_player(202, self.GROUP_ID - 1)
@@ -929,11 +1013,40 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             context = self._context(database, ["250"])
 
             with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
-                await give_infinite(update, context)
+                await give_cash(update, context)
 
             player = await database.get_player(204, self.GROUP_ID)
             self.assertEqual(player["cash"], 750)
             self.assertIn("250$", message.reply_text.await_args.args[0])
+
+    async def test_give_cash_without_amount_uses_cap_and_amount_is_exact(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            database = Database(str(Path(temp_dir) / "admin_max_credit.sqlite3"))
+            await database.initialize()
+            await database.ensure_player(self.ADMIN_ID, "admin", self.GROUP_ID)
+            await database.toggle_admin_dev_mode(self.ADMIN_ID)
+            message = SimpleNamespace(
+                reply_text=AsyncMock(),
+                reply_to_message=None,
+            )
+            update = self._update(self.ADMIN_ID, message)
+            context = self._context(database, [])
+
+            with patch("bot.ADMIN_USER_IDS", frozenset({self.ADMIN_ID})):
+                context.args = ["250"]
+                await give_cash(update, context)
+                player = await database.get_player(self.ADMIN_ID, self.GROUP_ID)
+                self.assertEqual(player["cash"], 750)
+                self.assertIn("250$", message.reply_text.await_args.args[0])
+
+                context.args = []
+                await give_cash(update, context)
+                player = await database.get_player(self.ADMIN_ID, self.GROUP_ID)
+                self.assertEqual(player["cash"], MAX_ADMIN_BALANCE)
+                self.assertIn(
+                    f"+{MAX_ADMIN_BALANCE - 750}$",
+                    message.reply_text.await_args.args[0],
+                )
 
     async def test_full_reset_requires_confirmation_and_is_group_scoped(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1412,15 +1525,18 @@ class ShopCallbackTests(unittest.IsolatedAsyncioTestCase):
         await shop_callback(update, context)
 
         text = query.edit_message_text.await_args.args[0]
-        self.assertIn("Protection & Défense (jeu)", text)
-        self.assertIn("Gilet de protection renforcé — niveau III+ (jeu)", text)
+        self.assertIn("Protections balistiques", text)
+        self.assertIn("Gilet pare-balles léger classe IIIA", text)
+        self.assertIn("Shield anti-émeute / bouclier balistique", text)
         markup = query.edit_message_text.await_args.kwargs["reply_markup"]
         callback_data = [
             button.callback_data
             for row in markup.inline_keyboard
             for button in row
         ]
-        self.assertIn("buy:101:tactical_vest_level_3", callback_data)
+        self.assertIn("buy:101:gilet_leger", callback_data)
+        self.assertIn("buy:101:gilet_lourd", callback_data)
+        self.assertIn("buy:101:shield_tactique", callback_data)
 
 
 class EditCallbackMessageTests(unittest.IsolatedAsyncioTestCase):
@@ -1775,7 +1891,7 @@ class MissionTests(unittest.IsolatedAsyncioTestCase):
 
         text = message.reply_text.await_args.args[0]
         self.assertIn("Mission logistique urbaine", text)
-        self.assertIn("Coordination de flotte", text)
+        self.assertIn("Course express", text)
         self.assertIn("niv. 10", text)
         self.assertIn("🔒 Verrouillée", text)
         self.assertIn("✅ Disponible", text)
@@ -1870,23 +1986,6 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
                 await database.purchase_item(888, "bixi", chat.id)
         return temp_dir, database, context, update, message, chat
 
-    async def test_dedicated_hustle_commands_dispatch_the_matching_mission(self) -> None:
-            update = SimpleNamespace()
-            context = SimpleNamespace()
-            commands = (
-                mission_colis,
-                mission_phishing,
-                mission_catalyseur,
-                mission_vapote,
-                mission_depanneur,
-                mission_sneakers,
-            )
-            with patch("bot.hustle_command", new_callable=AsyncMock) as hustle_command:
-                for command, hustle in zip(commands, HUSTLES):
-                    await command(update, context)
-                    hustle_command.assert_awaited_with(update, context, hustle)
-                    hustle_command.reset_mock()
-
     async def test_mission_menu_lists_hustles_and_cooldowns(self) -> None:
         temp_dir, _, context, update, message, _ = await self._setup_hustle([])
         self.addCleanup(temp_dir.cleanup)
@@ -1894,8 +1993,8 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
         await missions(update, context)
 
         text = message.reply_text.await_args.args[0]
-        self.assertIn("/mission_colis", text)
-        self.assertIn("/mission_phishing", text)
+        self.assertIn("/mission colis", text)
+        self.assertIn("/mission phishing", text)
         self.assertIn("Cooldown: 20s", text)
         self.assertIn("Gain fixe: 115$ | XP: 5", text)
         self.assertIn("véhicule requis", text)
@@ -2014,7 +2113,8 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
             patch("bot.random.random", return_value=0.0),
             patch("bot.random.randint", side_effect=AssertionError("cash must be fixed")),
         ):
-            await mission_colis(update, context)
+            context.args = ["colis"]
+            await missions(update, context)
 
         player = await database.get_player(chat.id, chat.id)
         self.assertEqual(player["cash"], 565)
@@ -2026,7 +2126,8 @@ class HustleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.addCleanup(temp_dir.cleanup)
 
-        await mission_colis(update, context)
+        context.args = ["colis"]
+        await missions(update, context)
 
         self.assertIn("/start", message.reply_text.await_args.args[0])
 
@@ -2107,6 +2208,129 @@ class BraquerChatTypeTests(unittest.IsolatedAsyncioTestCase):
                 reply_text.assert_awaited_once_with(
                     "Le défi PVP est verrouillé jusqu'au niveau 20."
                 )
+
+    async def test_braquer_failure_uses_random_fine_and_jail_duration(self) -> None:
+        from game import PvpResult
+
+        with TemporaryDirectory() as temp_dir:
+            database = Database(str(Path(temp_dir) / "braquer_random.sqlite3"))
+            await database.initialize()
+            await database.ensure_player(101, "attaquant", -1001)
+            await database.ensure_player(102, "cible", -1001)
+            async with database.transaction() as connection:
+                await connection.execute(
+                    """
+                    UPDATE players SET cash = 3000, xp = 19000, level = 20
+                    WHERE user_id = ? AND chat_id = ?
+                    """,
+                    (101, -1001),
+                )
+            context = SimpleNamespace(
+                application=SimpleNamespace(bot_data={"database": database}),
+                args=["@cible"],
+            )
+            message = SimpleNamespace(reply_text=AsyncMock(), sender_chat=None)
+            update = SimpleNamespace(
+                effective_user=SimpleNamespace(
+                    id=101, username="attaquant", full_name="Attaquant", is_bot=False
+                ),
+                effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
+                effective_message=message,
+            )
+            with (
+                patch(
+                    "bot.resolve_pvp",
+                    return_value=PvpResult(
+                        "failed", "Le défi échoue.", prison_seconds=45
+                    ),
+                ),
+                patch("bot.random.randint", side_effect=[75, 600]) as randint,
+                patch("bot.prison_deadline", return_value=4_000_000_000) as deadline,
+            ):
+                await braquer(update, context)
+
+            player = await database.get_player(101, -1001)
+            self.assertEqual(player["cash"], 2400)
+            self.assertEqual(player["in_prison_until"], 4_000_000_000)
+            self.assertEqual(randint.call_args_list[0].args, (30, 120))
+            self.assertEqual(randint.call_args_list[1].args, (250, 1000))
+            deadline.assert_called_once_with(75)
+            response = message.reply_text.await_args.args[0]
+            self.assertIn("75 secondes", response)
+            self.assertIn("600$", response)
+
+    async def test_braquer_applies_best_protection_and_reports_armor_block(self) -> None:
+        from game import PvpResult
+
+        for item_id, reduction, expected_text in (
+            ("gilet_lourd", 0.20, "encaisse le braquage grâce à son gilet lourd"),
+            ("shield_tactique", 0.35, "Le shield de @cible bloque tout"),
+        ):
+            with self.subTest(item_id=item_id), TemporaryDirectory() as temp_dir:
+                database = Database(str(Path(temp_dir) / "braquer_armor.sqlite3"))
+                await database.initialize()
+                await database.ensure_player(101, "attaquant", -1001)
+                await database.ensure_player(102, "cible", -1001)
+                async with database.transaction() as connection:
+                    await connection.execute(
+                        """
+                        UPDATE players SET cash = 3000, xp = 19000, level = 20
+                        WHERE user_id = ? AND chat_id = ?
+                        """,
+                        (101, -1001),
+                    )
+                    await connection.execute(
+                        """
+                        UPDATE players SET cash = 20000, xp = 19000, level = 20
+                        WHERE user_id = ? AND chat_id = ?
+                        """,
+                        (102, -1001),
+                    )
+                self.assertEqual(
+                    await database.purchase_item(102, item_id, -1001), "ok"
+                )
+                context = SimpleNamespace(
+                    application=SimpleNamespace(bot_data={"database": database}),
+                    args=["@cible"],
+                )
+                message = SimpleNamespace(reply_text=AsyncMock(), sender_chat=None)
+                update = SimpleNamespace(
+                    effective_user=SimpleNamespace(
+                        id=101,
+                        username="attaquant",
+                        full_name="Attaquant",
+                        is_bot=False,
+                    ),
+                    effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
+                    effective_message=message,
+                )
+                with (
+                    patch(
+                        "bot.resolve_pvp",
+                        return_value=PvpResult(
+                            "failed",
+                            "Échec de test.",
+                            prison_seconds=45,
+                            protection_blocked=True,
+                            protection_item_id=item_id,
+                            protection_name=item_id,
+                        ),
+                    ) as resolve,
+                    patch("bot.random.randint", side_effect=[75, 600]),
+                    patch("bot.prison_deadline", return_value=4_000_000_000),
+                ):
+                    await braquer(update, context)
+
+                resolve.assert_called_once()
+                self.assertEqual(
+                    resolve.call_args.kwargs["victim_protection"], reduction
+                )
+                self.assertEqual(
+                    resolve.call_args.kwargs["victim_protection_item_id"], item_id
+                )
+                response = message.reply_text.await_args.args[0]
+                self.assertIn(expected_text, response)
+                self.assertIn("SPVM arrive en trombe", response)
 
 
 class ShootCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -2231,9 +2455,9 @@ class ShootCommandTests(unittest.IsolatedAsyncioTestCase):
 
 
 class JuggCallbackTests(unittest.IsolatedAsyncioTestCase):
-    async def test_jugg_menu_contains_three_payout_tiers_and_legacy_actions(self) -> None:
+    async def test_jugg_menu_contains_unlocked_tiers_and_legacy_actions(self) -> None:
         database = AsyncMock()
-        database.get_player.return_value = {"level": 1, "in_prison_until": 0}
+        database.get_player.return_value = {"level": 60, "in_prison_until": 0}
         database.get_item_effects.return_value = {"has_obd": False}
         context = SimpleNamespace(
             application=SimpleNamespace(bot_data={"database": database})
@@ -2250,7 +2474,7 @@ class JuggCallbackTests(unittest.IsolatedAsyncioTestCase):
         await jugg(update, context)
 
         text = message.reply_text.await_args.args[0]
-        self.assertIn("mini-jeux fictifs", text)
+        self.assertIn("progression par niveau", text)
         markup = message.reply_text.await_args.kwargs["reply_markup"]
         buttons = [
             button
@@ -2262,6 +2486,7 @@ class JuggCallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("jugg:101:bloc", callbacks)
         self.assertIn("jugg:101:centre_ville", callbacks)
         self.assertIn("jugg:101:international", callbacks)
+        self.assertIn("jugg:101:elite", callbacks)
         self.assertTrue(any("1200$" in label for label in labels))
         self.assertTrue(any("4500$" in label for label in labels))
         self.assertTrue(any("15000$" in label for label in labels))
@@ -2271,6 +2496,7 @@ class JuggCallbackTests(unittest.IsolatedAsyncioTestCase):
         from game import JuggResult
 
         database = AsyncMock()
+        database.get_player.return_value = {"level": 1, "in_prison_until": 0}
         database.get_item_effects.return_value = {"xp_bonus": 0}
         database.apply_jugg_result.return_value = {
             "status": "ok",
@@ -2317,6 +2543,7 @@ class JuggCallbackTests(unittest.IsolatedAsyncioTestCase):
         from game import JuggResult
 
         database = AsyncMock()
+        database.get_player.return_value = {"level": 1, "in_prison_until": 0}
         database.apply_jugg_result.return_value = {
             "status": "cooldown",
             "remaining": 12,
@@ -2442,6 +2669,155 @@ class ConfigurationTests(unittest.TestCase):
                 RuntimeError, "BOT_TOKEN est absente"
             ):
                 validate_config()
+
+    def test_db_path_environment_variable_takes_precedence_and_is_absolute(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "DB_PATH": str(Path("C:\\persistent") / "rabza.sqlite3"),
+                "DATABASE_PATH": str(Path("C:\\legacy") / "ignored.sqlite3"),
+            },
+        ):
+            loaded_config = importlib.reload(config_module)
+            self.assertEqual(
+                loaded_config.DATABASE_PATH,
+                str(Path("C:/persistent/rabza.sqlite3")),
+            )
+            self.assertTrue(Path(loaded_config.DATABASE_PATH).is_absolute())
+        importlib.reload(config_module)
+
+
+class InvestmentCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_market_display_partial_sale_and_sell_all(self) -> None:
+        temp_dir = TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        database = Database(str(Path(temp_dir.name) / "investment.sqlite3"))
+        await database.initialize()
+        await database.ensure_player(801, "investisseur", -100801)
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database}),
+            args=[],
+        )
+        message = SimpleNamespace(reply_text=AsyncMock(), sender_chat=None)
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=801,
+                username="investisseur",
+                full_name="Investisseur",
+                is_bot=False,
+            ),
+            effective_chat=SimpleNamespace(id=-100801, type="supergroup"),
+            effective_message=message,
+        )
+
+        await invest(update, context)
+        self.assertIn("BTC — Bitcoin", message.reply_text.await_args.args[0])
+        self.assertIn("/invest sell all", message.reply_text.await_args.args[0])
+
+        context.args = ["buy", "SOL", "2"]
+        await invest(update, context)
+        self.assertIn("Achat de 2 SOL", message.reply_text.await_args.args[0])
+        self.assertEqual(
+            (await database.get_player(801, -100801))["cash"], 210
+        )
+
+        context.args = ["sell", "SOL", "1"]
+        await invest(update, context)
+        self.assertIn("+0.00%", message.reply_text.await_args.args[0])
+        self.assertEqual(
+            (await database.get_player(801, -100801))["cash"], 355
+        )
+
+        context.args = ["sell", "all"]
+        await invest(update, context)
+        self.assertIn("Vente totale", message.reply_text.await_args.args[0])
+        self.assertEqual(
+            (await database.get_player(801, -100801))["cash"], 500
+        )
+        self.assertEqual(
+            (await database.get_market_snapshot(801, -100801))["portfolio"]["value"],
+            0,
+        )
+
+        context.args = ["SOL", "1"]
+        context.args = ["buy", "SOL", "1"]
+        await invest(update, context)
+        self.assertIn("Achat de 1 SOL", message.reply_text.await_args.args[0])
+        self.assertEqual((await database.get_player(801, -100801))["cash"], 355)
+
+
+class ProgressionMenuTests(unittest.IsolatedAsyncioTestCase):
+    async def test_level_sixty_has_no_lower_level_gates_in_missions_or_jugg(self) -> None:
+        temp_dir = TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        database = Database(str(Path(temp_dir.name) / "max_level.sqlite3"))
+        await database.initialize()
+        await database.ensure_player(802, "boss", -100802)
+        async with database.transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE players SET xp = 177000, level = 60
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (802, -100802),
+            )
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database}),
+            args=[],
+        )
+        message = SimpleNamespace(reply_text=AsyncMock(), sender_chat=None)
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=802, username="boss", full_name="Boss", is_bot=False
+            ),
+            effective_chat=SimpleNamespace(id=-100802, type="supergroup"),
+            effective_message=message,
+        )
+
+        await missions(update, context)
+        mission_text = message.reply_text.await_args.args[0]
+        self.assertNotIn("Verrouillée", mission_text)
+        self.assertIn("✅ Disponible — niv. 20", mission_text)
+
+        await jugg(update, context)
+        jugg_text = message.reply_text.await_args.args[0]
+        self.assertNotIn("Prochain palier Jugg", jugg_text)
+        callbacks = {
+            button.callback_data
+            for row in message.reply_text.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            for button in row
+        }
+        self.assertIn("jugg:802:elite", callbacks)
+
+    async def test_locked_jugg_tier_is_rejected_server_side(self) -> None:
+        temp_dir = TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        database = Database(str(Path(temp_dir.name) / "locked_jugg.sqlite3"))
+        await database.initialize()
+        await database.ensure_player(803, "beginner", -100803)
+        query = AsyncMock(data="jugg:803:elite")
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(
+                id=803,
+                username="beginner",
+                full_name="Beginner",
+                is_bot=False,
+            ),
+            effective_chat=SimpleNamespace(id=-100803, type="supergroup"),
+            effective_message=SimpleNamespace(sender_chat=None),
+            callback_query=query,
+        )
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"database": database})
+        )
+
+        await handle_jugg_tier(update, context)
+
+        self.assertIn("niveau 15", query.edit_message_text.await_args.args[0])
+        player = await database.get_player(803, -100803)
+        self.assertEqual(player["last_jugg_time"], 0)
 
 
 if __name__ == "__main__":

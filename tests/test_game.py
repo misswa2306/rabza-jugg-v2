@@ -1,6 +1,6 @@
 import unittest
 import random
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from game import (
     BASE_SUCCESS_RATE,
@@ -19,7 +19,16 @@ class ResolveActionTests(unittest.TestCase):
                 (tier.tier_id, tier.success_reward, tier.cooldown_seconds)
                 for tier in JUGG_TIERS
             ],
-            [("bloc", 1200, 15), ("centre_ville", 4500, 25), ("international", 15000, 30)],
+            [
+                ("bloc", 1200, 15),
+                ("centre_ville", 4500, 25),
+                ("international", 15000, 30),
+                ("elite", 25000, 35),
+            ],
+        )
+        self.assertEqual(
+            [tier.min_level for tier in JUGG_TIERS],
+            [1, 3, 7, 15],
         )
 
     def test_jugg_success_and_failure_resolve_to_game_only_outcomes(self) -> None:
@@ -90,6 +99,10 @@ class ResolveActionTests(unittest.TestCase):
         with patch("game.time.time", return_value=1_700_000_000):
             deadline = prison_deadline()
         self.assertEqual(deadline, 1_700_000_045)
+        with patch("game.time.time", return_value=1_700_000_000):
+            self.assertEqual(prison_deadline(90), 1_700_000_090)
+        with self.assertRaises(ValueError):
+            prison_deadline(0)
         before = time.time()
         deadline = prison_deadline()
         elapsed = deadline - before
@@ -144,11 +157,50 @@ class ResolveActionTests(unittest.TestCase):
         self.assertEqual(level_one, {"berri", "bixi"})
         level_ten = {action for action, _ in actions_available(10, False)}
         self.assertTrue({"berri", "bixi", "dep", "marketplace"} <= level_ten)
+        level_five = {action for action, _ in actions_available(5, False)}
+        self.assertIn("dep", level_five)
+        self.assertNotIn("port", level_five)
+        level_seven = {action for action, _ in actions_available(7, False)}
+        self.assertIn("port", level_seven)
+        self.assertNotIn("jewelry", level_seven)
+        level_ten_with_obd = {action for action, _ in actions_available(10, True)}
+        self.assertIn("steal_rav4", level_ten_with_obd)
+        level_fifteen = {action for action, _ in actions_available(15, True)}
+        self.assertTrue({"steal_lexus", "jewelry", "port"} <= level_fifteen)
         level_twenty_with_obd = {
             action for action, _ in actions_available(20, True)
         }
         self.assertIn("steal_rav4", level_twenty_with_obd)
-        self.assertNotIn("jewelry", level_twenty_with_obd)
+        self.assertIn("jewelry", level_twenty_with_obd)
+
+    def test_missions_follow_the_progression_milestones(self) -> None:
+        from bot import MISSIONS
+
+        levels = {mission.mission_id: mission.min_level for mission in MISSIONS}
+        self.assertEqual(
+            {
+                "civic": levels["civic"],
+                "audi": levels["audi"],
+                "entrepot": levels["entrepot"],
+                "depot": levels["depot"],
+                "port": levels["port"],
+                "blindee": levels["blindee"],
+                "crypto": levels["crypto"],
+                "bijouterie": levels["bijouterie"],
+                "banque_centrale": levels["banque_centrale"],
+            },
+            {
+                "civic": 1,
+                "audi": 3,
+                "entrepot": 5,
+                "depot": 5,
+                "port": 7,
+                "blindee": 10,
+                "crypto": 10,
+                "bijouterie": 15,
+                "banque_centrale": 20,
+            },
+        )
 
     def test_high_tier_equipment_bonus_applies(self) -> None:
         result = resolve_action("port", roll=0.40, success_bonus=0.15)
@@ -187,6 +239,18 @@ class ResolveActionTests(unittest.TestCase):
         self.assertEqual(unarmed.outcome, "failed")
         self.assertEqual(armed.outcome, "success")
         self.assertEqual(armed.transfer_rate, 0.25)
+
+    def test_pvp_default_rolls_use_integer_random_draws(self) -> None:
+        from game import resolve_pvp
+
+        with patch("game.random.randint", side_effect=[0, 9999, 0]) as draw:
+            result = resolve_pvp(False, False)
+
+        self.assertEqual(result.outcome, "success")
+        self.assertEqual(
+            draw.call_args_list,
+            [call(0, 9_999)] * 3,
+        )
 
     def test_victim_weapon_riposte_chance_is_60_percent(self) -> None:
         from game import resolve_pvp
@@ -280,6 +344,46 @@ class ResolveActionTests(unittest.TestCase):
         )
         self.assertEqual(defended.outcome, "counter")
         self.assertEqual(not_defended.outcome, "success")
+
+    def test_ballistic_protection_reduces_robbery_chance_and_keeps_ten_percent_floor(
+        self,
+    ) -> None:
+        from game import resolve_pvp
+
+        for protection, attack_roll in ((0.10, 0.45), (0.20, 0.35), (0.35, 0.20)):
+            with self.subTest(protection=protection):
+                result = resolve_pvp(
+                    attacker_has_weapon=False,
+                    victim_has_weapon=False,
+                    attack_roll=attack_roll,
+                    counter_roll=0.99,
+                    transfer_roll=0.5,
+                    victim_protection=protection,
+                    victim_protection_item_id="shield_tactique",
+                    victim_protection_name="Bouclier",
+                )
+                self.assertEqual(result.outcome, "failed")
+                self.assertTrue(result.protection_blocked)
+                self.assertEqual(result.protection_item_id, "shield_tactique")
+                self.assertEqual(result.protection_name, "Bouclier")
+
+        floor_success = resolve_pvp(
+            attacker_has_weapon=False,
+            victim_has_weapon=False,
+            attack_roll=0.09,
+            counter_roll=0.99,
+            victim_protection=0.90,
+        )
+        floor_failure = resolve_pvp(
+            attacker_has_weapon=False,
+            victim_has_weapon=False,
+            attack_roll=0.10,
+            counter_roll=0.99,
+            victim_protection=0.90,
+        )
+        self.assertEqual(floor_success.outcome, "success")
+        self.assertEqual(floor_failure.outcome, "failed")
+        self.assertTrue(floor_failure.protection_blocked)
 
     @patch("game.random.random", return_value=0.69)
     def test_default_roll_uses_random_module(self, random_roll) -> None:

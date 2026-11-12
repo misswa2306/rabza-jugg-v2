@@ -2,7 +2,10 @@
 
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+import logging
 from pathlib import Path
+import math
+import random
 import time
 from typing import Any, AsyncIterator
 
@@ -10,7 +13,9 @@ import aiosqlite
 
 from game import (
     ITEMS,
+    LEGACY_PROTECTION_ITEM_MIGRATIONS,
     MAX_LEVEL,
+    PVP_PROTECTION_REDUCTIONS,
     VEHICLE_RENTAL_TERMS,
     level_for_xp,
     vehicle_rental_quote,
@@ -22,11 +27,36 @@ MAX_HUSTLE_COOLDOWN_SECONDS = 30
 MAX_ADMIN_BALANCE = 1_000_000_000_000
 MAX_ADMIN_XP = 999_999_999_999
 MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
+MARKET_UPDATE_INTERVAL_SECONDS = 180
+MARKET_ASSETS = (
+    ("BTC", "Bitcoin", "crypto", 65_000.0),
+    ("ETH", "Ethereum", "crypto", 3_400.0),
+    ("SOL", "Solana", "crypto", 145.0),
+    ("514-TEL", "514-TEL — Télécoms", "actions", 125.0),
+    ("ANJOU-MOTORS", "ANJOU-MOTORS — Concessionnaire", "actions", 240.0),
+    ("HYDRO-MTL", "HYDRO-MTL — Énergie", "actions", 92.0),
+    ("RUE-STE-CATH", "RUE-STE-CATH — Immobilier", "actions", 180.0),
+)
+logger = logging.getLogger(__name__)
 
 
 def _reward_xp(xp_gain: int, cash_delta: int) -> int:
     """Never persist a positive cash reward without at least one XP."""
     return max(1, xp_gain) if cash_delta > 0 else max(0, xp_gain)
+
+
+def _market_percentage_change(current: float, reference: float, label: str) -> float:
+    if (
+        not math.isfinite(current)
+        or current < 0
+        or not math.isfinite(reference)
+        or reference <= 0
+    ):
+        raise RuntimeError(f"Valeurs invalides pour le calcul de {label}.")
+    percentage = (current - reference) / reference * 100
+    if not math.isfinite(percentage):
+        raise RuntimeError(f"Pourcentage invalide pour le calcul de {label}.")
+    return percentage
 
 
 def _epoch_timestamp(value: object) -> float | None:
@@ -53,8 +83,9 @@ def _epoch_timestamp(value: object) -> float | None:
 class Database:
     def __init__(self, path: str) -> None:
         if path == ":memory:":
-            self.path = path
-            return
+            raise ValueError(
+                "La base doit utiliser un fichier persistant; ':memory:' est interdit."
+            )
         database_path = Path(path).expanduser()
         if not database_path.is_absolute():
             database_path = Path(__file__).resolve().parent / database_path
@@ -64,6 +95,8 @@ class Database:
     async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
         """Open an immediate SQLite transaction and roll it back on errors."""
         async with aiosqlite.connect(self.path) as connection:
+            await connection.execute("PRAGMA synchronous = FULL")
+            await connection.execute("PRAGMA foreign_keys = ON")
             await connection.execute("BEGIN IMMEDIATE")
             try:
                 yield connection
@@ -74,9 +107,11 @@ class Database:
                 await connection.commit()
 
     async def initialize(self) -> None:
-        if self.path != ":memory:":
-            Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self.path) as connection:
+            await connection.execute("PRAGMA journal_mode = WAL")
+            await connection.execute("PRAGMA synchronous = FULL")
+            await connection.execute("PRAGMA foreign_keys = ON")
             cursor = await connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
@@ -445,6 +480,61 @@ class Database:
                 )
                 """
             )
+            await connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS market_assets (
+                    symbol TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    asset_type TEXT NOT NULL CHECK (asset_type IN ('crypto', 'actions')),
+                    current_price REAL NOT NULL CHECK (current_price > 0),
+                    opening_price REAL NOT NULL CHECK (opening_price > 0),
+                    last_updated REAL NOT NULL,
+                    last_event TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            cursor = await connection.execute("PRAGMA table_info(market_assets)")
+            market_asset_columns = {row[1] for row in await cursor.fetchall()}
+            if "last_event" not in market_asset_columns:
+                await connection.execute(
+                    """
+                    ALTER TABLE market_assets
+                    ADD COLUMN last_event TEXT NOT NULL DEFAULT ''
+                    """
+                )
+            await connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS market_positions (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    symbol TEXT NOT NULL REFERENCES market_assets(symbol),
+                    quantity REAL NOT NULL CHECK (quantity > 0),
+                    average_cost REAL NOT NULL CHECK (average_cost > 0),
+                    PRIMARY KEY (chat_id, user_id, symbol),
+                    FOREIGN KEY (chat_id, user_id)
+                        REFERENCES players(chat_id, user_id) ON DELETE CASCADE
+                )
+                """
+            )
+            market_opened_at = time.time()
+            await connection.executemany(
+                """
+                INSERT OR IGNORE INTO market_assets
+                    (symbol, name, asset_type, current_price, opening_price, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        symbol,
+                        name,
+                        asset_type,
+                        price,
+                        price,
+                        market_opened_at,
+                    )
+                    for symbol, name, asset_type, price in MARKET_ASSETS
+                ],
+            )
             await connection.executemany(
                 """
                 INSERT INTO items
@@ -498,11 +588,44 @@ class Database:
                           ON p.chat_id = inv.chat_id AND p.user_id = inv.user_id
                     """
                 else:
+                    scope_query = """
+                        SELECT user_id,
+                               CASE
+                                   WHEN MAX(CASE WHEN chat_id = user_id THEN 1 ELSE 0 END) = 1
+                                       THEN user_id
+                                   WHEN COUNT(*) = 1 THEN MIN(chat_id)
+                               END AS chat_id
+                        FROM players
+                        GROUP BY user_id
+                        HAVING MAX(CASE WHEN chat_id = user_id THEN 1 ELSE 0 END) = 1
+                            OR COUNT(*) = 1
+                    """
+                    cursor = await connection.execute(
+                        f"""
+                        SELECT DISTINCT inv.user_id
+                        FROM {inventory_backup_table} AS inv
+                        LEFT JOIN ({scope_query}) AS scope
+                          ON scope.user_id = inv.user_id
+                        WHERE scope.chat_id IS NULL
+                        """
+                    )
+                    unmapped_users = [int(row[0]) for row in await cursor.fetchall()]
+                    if unmapped_users:
+                        logger.warning(
+                            "Inventaire historique non migré pour les utilisateurs "
+                            "sans conversation déterminable: %s. Les données restent "
+                            "dans la table %s.",
+                            unmapped_users,
+                            inventory_backup_table,
+                        )
                     legacy_inventory_select = f"""
                         SELECT p.chat_id, inv.user_id, inv.item_id,
                                {legacy_quantity}
                         FROM {inventory_backup_table} AS inv
-                        JOIN players AS p ON p.user_id = inv.user_id
+                        JOIN ({scope_query}) AS scope
+                          ON scope.user_id = inv.user_id
+                        JOIN players AS p
+                          ON p.user_id = scope.user_id AND p.chat_id = scope.chat_id
                     """
                 await connection.execute(
                     f"""
@@ -510,6 +633,26 @@ class Database:
                         (chat_id, user_id, item_id, quantity)
                     {legacy_inventory_select}
                     """
+                )
+            for old_item_id, new_item_id in LEGACY_PROTECTION_ITEM_MIGRATIONS.items():
+                await connection.execute(
+                    """
+                    INSERT INTO inventory (chat_id, user_id, item_id, quantity)
+                    SELECT chat_id, user_id, ?, quantity
+                    FROM inventory
+                    WHERE item_id = ?
+                    ON CONFLICT(chat_id, user_id, item_id)
+                    DO UPDATE SET quantity = quantity + excluded.quantity
+                    """,
+                    (new_item_id, old_item_id),
+                )
+                await connection.execute(
+                    "DELETE FROM inventory WHERE item_id = ?",
+                    (old_item_id,),
+                )
+                await connection.execute(
+                    "DELETE FROM items WHERE item_id = ?",
+                    (old_item_id,),
                 )
             await connection.commit()
             if migrate_players or migrate_inventory:
@@ -590,6 +733,421 @@ class Database:
             )
             row = await cursor.fetchone()
             return int(row[0]) if row is not None else None
+
+    async def update_market_prices(self, now: float | None = None) -> int:
+        """Advance the persisted market by each elapsed three-minute interval."""
+        current_time = time.time() if now is None else now
+        if not math.isfinite(current_time):
+            raise ValueError("L'heure de mise à jour du marché doit être finie.")
+        updated_count = 0
+        async with self.transaction() as connection:
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                """
+                SELECT symbol, current_price, last_updated
+                FROM market_assets ORDER BY symbol
+                """
+            )
+            assets = await cursor.fetchall()
+            for asset in assets:
+                previous_update = float(asset["last_updated"])
+                price = float(asset["current_price"])
+                if (
+                    not math.isfinite(previous_update)
+                    or not math.isfinite(price)
+                    or price <= 0
+                ):
+                    raise RuntimeError(
+                        f"Données de marché invalides pour {asset['symbol']}."
+                    )
+                elapsed_ticks = int(
+                    (current_time - previous_update)
+                    // MARKET_UPDATE_INTERVAL_SECONDS
+                )
+                if elapsed_ticks <= 0:
+                    continue
+                tick_count = min(elapsed_ticks, 48)
+                last_event = ""
+                for _ in range(tick_count):
+                    change = random.uniform(-0.04, 0.04)
+                    if random.random() < 0.03:
+                        event_change = random.choice((-0.12, 0.12))
+                        change += event_change
+                        last_event = (
+                            "Correction de marché"
+                            if event_change < 0
+                            else "Entrée de capitaux"
+                        )
+                    else:
+                        last_event = ""
+                    next_price = price * (1 + change)
+                    if not math.isfinite(next_price):
+                        raise RuntimeError(
+                            f"Variation de cours invalide pour {asset['symbol']}."
+                        )
+                    price = max(0.01, round(next_price, 2))
+                next_update = (
+                    current_time
+                    if elapsed_ticks > tick_count
+                    else previous_update
+                    + elapsed_ticks * MARKET_UPDATE_INTERVAL_SECONDS
+                )
+                await connection.execute(
+                    """
+                    UPDATE market_assets
+                    SET current_price = ?, last_updated = ?, last_event = ?
+                    WHERE symbol = ?
+                    """,
+                    (price, next_update, last_event, str(asset["symbol"])),
+                )
+                updated_count += 1
+        return updated_count
+
+    async def get_market_snapshot(
+        self, user_id: int, chat_id: int
+    ) -> dict[str, Any]:
+        await self.update_market_prices()
+        async with aiosqlite.connect(self.path) as connection:
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                """
+                SELECT symbol, name, asset_type, current_price, opening_price,
+                       last_event
+                FROM market_assets
+                ORDER BY CASE asset_type WHEN 'crypto' THEN 0 ELSE 1 END, symbol
+                """
+            )
+            assets = [dict(row) for row in await cursor.fetchall()]
+            cursor = await connection.execute(
+                """
+                SELECT symbol, quantity, average_cost
+                FROM market_positions
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (user_id, chat_id),
+            )
+            positions = {
+                str(row["symbol"]): {
+                    "quantity": float(row["quantity"]),
+                    "average_cost": float(row["average_cost"]),
+                }
+                for row in await cursor.fetchall()
+            }
+
+        portfolio_cost = 0.0
+        portfolio_value = 0.0
+        for asset in assets:
+            symbol = str(asset["symbol"])
+            price = float(asset["current_price"])
+            opening_price = float(asset["opening_price"])
+            market_change_percent = _market_percentage_change(
+                price, opening_price, f"cours d'ouverture de {symbol}"
+            )
+            position = positions.get(symbol)
+            quantity = position["quantity"] if position else 0.0
+            average_cost = position["average_cost"] if position else 0.0
+            if position and (
+                not math.isfinite(quantity)
+                or quantity <= 0
+                or not math.isfinite(average_cost)
+                or average_cost <= 0
+            ):
+                raise RuntimeError(f"Position de marché invalide pour {symbol}.")
+            cost_basis = average_cost * quantity
+            value = price * quantity
+            if not math.isfinite(cost_basis) or not math.isfinite(value):
+                raise RuntimeError(f"Valeur de portefeuille invalide pour {symbol}.")
+            profit_percent = (
+                _market_percentage_change(price, average_cost, f"prix moyen de {symbol}")
+                if position
+                else 0.0
+            )
+            asset.update(
+                {
+                    "market_change_percent": market_change_percent,
+                    "quantity": quantity,
+                    "average_cost": average_cost,
+                    "cost_basis": cost_basis,
+                    "value": value,
+                    "profit": value - cost_basis,
+                    "profit_percent": profit_percent,
+                }
+            )
+            portfolio_cost += cost_basis
+            portfolio_value += value
+        portfolio_profit = portfolio_value - portfolio_cost
+        if not all(
+            math.isfinite(value)
+            for value in (portfolio_cost, portfolio_value, portfolio_profit)
+        ):
+            raise RuntimeError("Valeur totale du portefeuille invalide.")
+        return {
+            "assets": assets,
+            "portfolio": {
+                "cost_basis": portfolio_cost,
+                "value": portfolio_value,
+                "profit": portfolio_profit,
+                "profit_percent": (
+                    _market_percentage_change(
+                        portfolio_value,
+                        portfolio_cost,
+                        "coût total du portefeuille",
+                    )
+                    if portfolio_cost
+                    else 0.0
+                ),
+            },
+        }
+
+    async def trade_investment(
+        self,
+        user_id: int,
+        chat_id: int,
+        symbol: str,
+        side: str,
+        quantity: float | None,
+    ) -> dict[str, int | float | str]:
+        normalized_symbol = symbol.strip().upper()
+        normalized_side = side.strip().casefold()
+        if normalized_side not in {"buy", "sell"}:
+            return {"status": "invalid"}
+        if quantity is None:
+            if normalized_side != "sell":
+                return {"status": "invalid"}
+        elif (
+            not math.isfinite(quantity)
+            or quantity <= 0
+            or quantity > MAX_SQLITE_INTEGER
+        ):
+            return {"status": "invalid"}
+        await self.update_market_prices()
+        async with self.transaction() as connection:
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                """
+                SELECT cash FROM players WHERE user_id = ? AND chat_id = ?
+                """,
+                (user_id, chat_id),
+            )
+            player = await cursor.fetchone()
+            if player is None:
+                return {"status": "missing"}
+            cursor = await connection.execute(
+                """
+                SELECT current_price FROM market_assets WHERE symbol = ?
+                """,
+                (normalized_symbol,),
+            )
+            asset = await cursor.fetchone()
+            if asset is None:
+                return {"status": "unknown_asset"}
+            price = float(asset["current_price"])
+            if not math.isfinite(price) or price <= 0:
+                raise RuntimeError(
+                    f"Cours de marché invalide pour {normalized_symbol}."
+                )
+            cursor = await connection.execute(
+                """
+                SELECT quantity, average_cost FROM market_positions
+                WHERE user_id = ? AND chat_id = ? AND symbol = ?
+                """,
+                (user_id, chat_id, normalized_symbol),
+            )
+            position = await cursor.fetchone()
+            cash = int(player["cash"])
+
+            if normalized_side == "buy":
+                if quantity is None:
+                    return {"status": "invalid"}
+                shares = round(quantity, 6)
+                if shares <= 0:
+                    return {"status": "invalid"}
+                gross_value = price * shares
+                if (
+                    not math.isfinite(gross_value)
+                    or gross_value > MAX_SQLITE_INTEGER
+                ):
+                    return {"status": "limit"}
+                total = int(round(gross_value))
+                if total <= 0:
+                    return {"status": "minimum"}
+                if cash < total:
+                    return {"status": "funds", "cash": cash, "total": total}
+                if position is None:
+                    new_quantity = shares
+                    average_cost = total / shares
+                    await connection.execute(
+                        """
+                        INSERT INTO market_positions
+                            (chat_id, user_id, symbol, quantity, average_cost)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            chat_id,
+                            user_id,
+                            normalized_symbol,
+                            new_quantity,
+                            average_cost,
+                        ),
+                    )
+                else:
+                    old_quantity = float(position["quantity"])
+                    old_cost_basis = old_quantity * float(position["average_cost"])
+                    new_quantity = round(old_quantity + shares, 6)
+                    average_cost = (old_cost_basis + total) / new_quantity
+                    await connection.execute(
+                        """
+                        UPDATE market_positions
+                        SET quantity = ?, average_cost = ?
+                        WHERE user_id = ? AND chat_id = ? AND symbol = ?
+                        """,
+                        (
+                            new_quantity,
+                            average_cost,
+                            user_id,
+                            chat_id,
+                            normalized_symbol,
+                        ),
+                    )
+                await connection.execute(
+                    """
+                    UPDATE players SET cash = cash - ?
+                    WHERE user_id = ? AND chat_id = ?
+                    """,
+                    (total, user_id, chat_id),
+                )
+                return {
+                    "status": "ok",
+                    "side": "buy",
+                    "symbol": normalized_symbol,
+                    "quantity": shares,
+                    "price": price,
+                    "total": total,
+                    "cash": cash - total,
+                    "average_cost": average_cost,
+                }
+
+            if position is None:
+                return {"status": "no_position"}
+            current_quantity = float(position["quantity"])
+            shares = current_quantity if quantity is None else round(quantity, 6)
+            if shares <= 0 or shares > current_quantity + 0.0000001:
+                return {
+                    "status": "quantity",
+                    "available": current_quantity,
+                }
+            shares = min(shares, current_quantity)
+            gross_value = price * shares
+            if (
+                not math.isfinite(gross_value)
+                or gross_value > MAX_SQLITE_INTEGER - cash
+            ):
+                return {"status": "limit"}
+            total = int(round(gross_value))
+            average_cost = float(position["average_cost"])
+            if not math.isfinite(average_cost) or average_cost <= 0:
+                raise RuntimeError(
+                    f"Prix moyen invalide pour la position {normalized_symbol}."
+                )
+            remaining = round(current_quantity - shares, 6)
+            if remaining <= 0.0000001:
+                await connection.execute(
+                    """
+                    DELETE FROM market_positions
+                    WHERE user_id = ? AND chat_id = ? AND symbol = ?
+                    """,
+                    (user_id, chat_id, normalized_symbol),
+                )
+                remaining = 0.0
+            else:
+                await connection.execute(
+                    """
+                    UPDATE market_positions SET quantity = ?
+                    WHERE user_id = ? AND chat_id = ? AND symbol = ?
+                    """,
+                    (remaining, user_id, chat_id, normalized_symbol),
+                )
+            await connection.execute(
+                """
+                UPDATE players SET cash = cash + ?
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (total, user_id, chat_id),
+            )
+            return {
+                "status": "ok",
+                "side": "sell",
+                "symbol": normalized_symbol,
+                "quantity": shares,
+                "price": price,
+                "total": total,
+                "cash": cash + total,
+                "remaining": remaining,
+                "profit": round((price - average_cost) * shares, 2),
+                "profit_percent": _market_percentage_change(
+                    price, average_cost, f"prix moyen de {normalized_symbol}"
+                ),
+            }
+
+    async def sell_all_investments(
+        self, user_id: int, chat_id: int
+    ) -> dict[str, int | float | str]:
+        await self.update_market_prices()
+        async with self.transaction() as connection:
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                """
+                SELECT cash FROM players WHERE user_id = ? AND chat_id = ?
+                """,
+                (user_id, chat_id),
+            )
+            player = await cursor.fetchone()
+            if player is None:
+                return {"status": "missing"}
+            cursor = await connection.execute(
+                """
+                SELECT p.symbol, p.quantity, p.average_cost, a.current_price
+                FROM market_positions AS p
+                JOIN market_assets AS a ON a.symbol = p.symbol
+                WHERE p.user_id = ? AND p.chat_id = ?
+                """,
+                (user_id, chat_id),
+            )
+            positions = await cursor.fetchall()
+            if not positions:
+                return {"status": "empty"}
+            cash = int(player["cash"])
+            gross_value = sum(
+                float(position["quantity"]) * float(position["current_price"])
+                for position in positions
+            )
+            if not math.isfinite(gross_value):
+                return {"status": "limit"}
+            total = sum(
+                int(round(float(position["quantity"]) * float(position["current_price"])))
+                for position in positions
+            )
+            if total > MAX_SQLITE_INTEGER - cash:
+                return {"status": "limit"}
+            await connection.execute(
+                """
+                DELETE FROM market_positions WHERE user_id = ? AND chat_id = ?
+                """,
+                (user_id, chat_id),
+            )
+            await connection.execute(
+                """
+                UPDATE players SET cash = cash + ?
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (total, user_id, chat_id),
+            )
+            return {
+                "status": "ok",
+                "count": len(positions),
+                "total": total,
+                "cash": cash + total,
+            }
 
     async def move_bank_funds(
         self,
@@ -1656,6 +2214,7 @@ class Database:
         self, user_id: int, chat_id: int = 0
     ) -> dict[str, float | int | bool | str | None]:
         async with aiosqlite.connect(self.path) as connection:
+            connection.row_factory = aiosqlite.Row
             cursor = await connection.execute(
                 """
                 SELECT
@@ -1667,9 +2226,7 @@ class Database:
                         THEN 1 ELSE 0 END), 0),
                     MAX(CASE WHEN i.category IN
                         ('armes_poing', 'armes_lourdes', 'armes_longues')
-                        THEN i.name END),
-                    MAX(CASE WHEN i.category = 'protection' THEN 1 ELSE 0 END),
-                    MAX(CASE WHEN i.category = 'protection' THEN i.name END)
+                        THEN i.name END)
                 FROM inventory AS inv
                 JOIN items AS i ON i.item_id = inv.item_id
                 WHERE inv.user_id = ? AND inv.chat_id = ?
@@ -1682,17 +2239,46 @@ class Database:
                 has_obd,
                 has_weapon,
                 weapon_name,
-                has_armor,
-                armor_name,
             ) = await cursor.fetchone()
+            protection_ids = tuple(PVP_PROTECTION_REDUCTIONS)
+            cursor = await connection.execute(
+                f"""
+                SELECT i.item_id, i.name
+                FROM inventory AS inv
+                JOIN items AS i ON i.item_id = inv.item_id
+                WHERE inv.user_id = ? AND inv.chat_id = ?
+                  AND i.item_id IN ({", ".join("?" for _ in protection_ids)})
+                """,
+                (user_id, chat_id, *protection_ids),
+            )
+            protections = await cursor.fetchall()
+            protection = max(
+                protections,
+                key=lambda row: PVP_PROTECTION_REDUCTIONS[str(row["item_id"])],
+                default=None,
+            )
+            protection_item_id = (
+                str(protection["item_id"]) if protection is not None else None
+            )
+            protection_name = (
+                str(protection["name"]) if protection is not None else None
+            )
+            protection_reduction = (
+                PVP_PROTECTION_REDUCTIONS[protection_item_id]
+                if protection_item_id is not None
+                else 0.0
+            )
             return {
                 "xp_bonus": xp_bonus,
                 "success_bonus": success_bonus,
                 "has_obd": bool(has_obd),
                 "has_weapon": bool(has_weapon),
                 "weapon_name": weapon_name,
-                "has_armor": bool(has_armor),
-                "armor_name": armor_name,
+                "has_armor": protection is not None,
+                "armor_name": protection_name,
+                "protection_reduction": protection_reduction,
+                "protection_item_id": protection_item_id,
+                "protection_name": protection_name,
             }
 
     async def get_weapon_profile(
@@ -1819,6 +2405,30 @@ class Database:
                 raise RuntimeError("Profil introuvable après le crédit administrateur.")
             return {"status": "ok", "cash": int(updated[0]), "bank": int(updated[1])}
 
+    async def admin_revoke_cash(
+        self, user_id: int, chat_id: int, amount: int | None, account: str = "cash"
+    ) -> dict[str, int | str]:
+        if (amount is not None and amount <= 0) or account not in {"cash", "bank"}:
+            return {"status": "invalid"}
+        async with self.transaction() as connection:
+            cursor = await connection.execute(
+                f"SELECT {account} FROM players WHERE user_id = ? AND chat_id = ?",
+                (user_id, chat_id),
+            )
+            player = await cursor.fetchone()
+            if player is None:
+                return {"status": "missing"}
+            current = int(player[0])
+            removed = current if amount is None else min(current, amount)
+            await connection.execute(
+                f"""
+                UPDATE players SET {account} = ?
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (current - removed, user_id, chat_id),
+            )
+            return {"status": "ok", "balance": current - removed, "removed": removed}
+
     async def admin_give_xp(
         self, user_id: int, chat_id: int, amount: int | None
     ) -> dict[str, int | str]:
@@ -1855,6 +2465,36 @@ class Database:
                 "level": new_level,
             }
 
+    async def admin_revoke_xp(
+        self, user_id: int, chat_id: int, amount: int | None
+    ) -> dict[str, int | str]:
+        if amount is not None and amount <= 0:
+            return {"status": "invalid"}
+        async with self.transaction() as connection:
+            cursor = await connection.execute(
+                "SELECT xp FROM players WHERE user_id = ? AND chat_id = ?",
+                (user_id, chat_id),
+            )
+            player = await cursor.fetchone()
+            if player is None:
+                return {"status": "missing"}
+            current_xp = int(player[0])
+            new_xp = 0 if amount is None else max(0, current_xp - amount)
+            new_level = level_for_xp(new_xp)
+            await connection.execute(
+                """
+                UPDATE players SET xp = ?, level = ?
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (new_xp, new_level, user_id, chat_id),
+            )
+            return {
+                "status": "ok",
+                "xp": new_xp,
+                "xp_removed": current_xp - new_xp,
+                "level": new_level,
+            }
+
     async def admin_set_level(
         self, user_id: int, chat_id: int, level: int
     ) -> dict[str, int | str]:
@@ -1876,6 +2516,36 @@ class Database:
                 (xp, level, user_id, chat_id),
             )
             return {"status": "ok", "xp": xp, "level": level}
+
+    async def admin_revoke_level(
+        self, user_id: int, chat_id: int, levels: int | None
+    ) -> dict[str, int | str]:
+        if levels is not None and levels <= 0:
+            return {"status": "invalid"}
+        async with self.transaction() as connection:
+            cursor = await connection.execute(
+                "SELECT level FROM players WHERE user_id = ? AND chat_id = ?",
+                (user_id, chat_id),
+            )
+            player = await cursor.fetchone()
+            if player is None:
+                return {"status": "missing"}
+            current_level = int(player[0])
+            new_level = 1 if levels is None else max(1, current_level - levels)
+            new_xp = 50 * new_level * (new_level - 1)
+            await connection.execute(
+                """
+                UPDATE players SET xp = ?, level = ?
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (new_xp, new_level, user_id, chat_id),
+            )
+            return {
+                "status": "ok",
+                "level": new_level,
+                "levels_removed": current_level - new_level,
+                "xp": new_xp,
+            }
 
     async def admin_give_item(
         self, user_id: int, chat_id: int, item_id: str | None
@@ -1965,6 +2635,95 @@ class Database:
                 "category": str(item["category"]),
             }
 
+    async def admin_revoke_item(
+        self, user_id: int, chat_id: int, item_id: str | None
+    ) -> dict[str, int | str]:
+        async with self.transaction() as connection:
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                "SELECT 1 FROM players WHERE user_id = ? AND chat_id = ?",
+                (user_id, chat_id),
+            )
+            if await cursor.fetchone() is None:
+                return {"status": "missing"}
+            if item_id is None or item_id.casefold() == "all":
+                cursor = await connection.execute(
+                    "SELECT COUNT(*) FROM inventory WHERE user_id = ? AND chat_id = ?",
+                    (user_id, chat_id),
+                )
+                count = int((await cursor.fetchone())[0])
+                await connection.execute(
+                    "DELETE FROM inventory WHERE user_id = ? AND chat_id = ?",
+                    (user_id, chat_id),
+                )
+                return {"status": "ok", "item_id": "all", "count": count}
+
+            normalized_item_id = item_id.strip().casefold()
+            cursor = await connection.execute(
+                """
+                SELECT items.item_id, items.name, inventory.quantity
+                FROM items
+                JOIN inventory ON inventory.item_id = items.item_id
+                WHERE inventory.user_id = ? AND inventory.chat_id = ?
+                ORDER BY items.min_level, items.price, items.item_id
+                """,
+                (user_id, chat_id),
+            )
+            owned_items = await cursor.fetchall()
+            item = next(
+                (
+                    candidate
+                    for candidate in owned_items
+                    if str(candidate["item_id"]).casefold() == normalized_item_id
+                ),
+                None,
+            )
+            if item is None:
+                item = next(
+                    (
+                        candidate
+                        for candidate in owned_items
+                        if str(candidate["name"]).casefold() == normalized_item_id
+                    ),
+                    None,
+                )
+            if item is None:
+                item = next(
+                    (
+                        candidate
+                        for candidate in owned_items
+                        if normalized_item_id
+                        in str(candidate["item_id"]).casefold()
+                        or normalized_item_id in str(candidate["name"]).casefold()
+                    ),
+                    None,
+                )
+            if item is None:
+                return {"status": "missing_item"}
+            quantity = int(item["quantity"])
+            if quantity > 1:
+                await connection.execute(
+                    """
+                    UPDATE inventory SET quantity = quantity - 1
+                    WHERE user_id = ? AND chat_id = ? AND item_id = ?
+                    """,
+                    (user_id, chat_id, str(item["item_id"])),
+                )
+            else:
+                await connection.execute(
+                    """
+                    DELETE FROM inventory
+                    WHERE user_id = ? AND chat_id = ? AND item_id = ?
+                    """,
+                    (user_id, chat_id, str(item["item_id"])),
+                )
+            return {
+                "status": "ok",
+                "item_id": str(item["item_id"]),
+                "name": str(item["name"]),
+                "removed": 1,
+            }
+
     async def admin_repair_player(
         self, user_id: int, chat_id: int
     ) -> str:
@@ -2010,6 +2769,10 @@ class Database:
                 return "missing"
             await connection.execute(
                 "DELETE FROM inventory WHERE user_id = ? AND chat_id = ?",
+                (user_id, chat_id),
+            )
+            await connection.execute(
+                "DELETE FROM market_positions WHERE user_id = ? AND chat_id = ?",
                 (user_id, chat_id),
             )
             await connection.execute(
@@ -2136,7 +2899,7 @@ class Database:
                 return None
             attacker = players[attacker_id]
             victim = players[victim_id]
-            if attacker["level"] < 20:
+            if attacker["level"] < 20 and not god_mode:
                 await connection.rollback()
                 return {"status": "level"}
             if not god_mode and attacker["in_prison_until"]:
@@ -2172,13 +2935,19 @@ class Database:
 
             if outcome != "success":
                 if outcome == "failed" and new_prison_until and not god_mode:
+                    actual_fine = min(int(attacker["cash"]), max(0, fine))
                     await connection.execute(
                         """
-                        UPDATE players SET in_prison_until = ?
+                        UPDATE players SET cash = cash - ?, in_prison_until = ?
                         WHERE user_id = ? AND chat_id = ?
                         """,
-                        (new_prison_until, attacker_id, chat_id),
+                        (actual_fine, new_prison_until, attacker_id, chat_id),
                     )
+                    await connection.commit()
+                    return {"status": "failed", "fine": actual_fine}
+                if outcome == "failed":
+                    await connection.commit()
+                    return {"status": "failed", "fine": 0}
                 await connection.commit()
                 return {"status": outcome}
 

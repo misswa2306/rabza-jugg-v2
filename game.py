@@ -62,6 +62,7 @@ class JuggTierSpec:
     cooldown_seconds: int
     success_heat: int
     xp: int
+    min_level: int = 1
 
 
 @dataclass(frozen=True)
@@ -74,19 +75,41 @@ class JuggResult:
 
 
 JUGG_TIERS = (
-    JuggTierSpec("bloc", "⚡ Petit Hustle de Bloc", 1200, 0.85, 150, 15, 1, 30),
     JuggTierSpec(
-        "centre_ville", "🔥 Gros Business Centre-Ville", 4500, 0.60, 700, 25, 3, 75
+        "bloc", "⚡ Petit Hustle de Bloc", 1200, 0.85, 150, 15, 1, 30, 1
+    ),
+    JuggTierSpec(
+        "centre_ville",
+        "🔥 Course express — Centre-Ville",
+        4500,
+        0.60,
+        700,
+        25,
+        3,
+        75,
+        3,
     ),
     JuggTierSpec(
         "international",
-        "👑 Opération Internationale / Masterclass",
+        "🚢 Opération portuaire",
         15000,
         0.35,
         2500,
         30,
         5,
         150,
+        7,
+    ),
+    JuggTierSpec(
+        "elite",
+        "👑 Jugg Élite — Parrain local",
+        25000,
+        0.25,
+        5000,
+        35,
+        8,
+        250,
+        15,
     ),
 )
 
@@ -178,6 +201,9 @@ class PvpResult:
     fine: int = 0
     xp_gain: int = 0
     transfer_rate: float = 0.0
+    protection_blocked: bool = False
+    protection_item_id: str | None = None
+    protection_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -406,7 +432,7 @@ ITEMS = (
         2,
         xp_bonus=2,
         success_bonus=0.01,
-        description="Accessoire de look monochrome pour ton avatar; effet purement visuel, sans fonction anti-caméra.",
+        description="Accessoire cosmétique monochrome pour ton avatar; aucun effet de dissimulation.",
     ),
     ShopItem(
         "carhartt_paintball_beanie",
@@ -953,25 +979,46 @@ ITEMS = (
         1,
         description="Objet virtuel classique du catalogue, destiné aux défis fictifs.",
     ),
-    ShopItem(
-        "tactical_vest_level_3",
-        "Gilet de protection renforcé — niveau III+ (jeu)",
-        "protection",
-        1800,
-        1,
-        description="Équipement de défense fictif; améliore la riposte dans les défis PVP simulés.",
-    ),
-    ShopItem(
-        "fast_ballistic_helmet",
-        "Casque de protection FAST — édition arcade",
-        "protection",
-        1200,
-        1,
-        description="Équipement de protection de collection, avec effet uniquement dans le jeu.",
-    ),
     ShopItem("bolt_cutter", "Coupe-boulon", "matos", 100, 1, success_bonus=0.02),
     ShopItem("obd_device", "Boîtier OBD Keyless", "matos", 4000, 20, success_bonus=0.03),
     ShopItem("gps_jammer", "Brouilleur GPS", "matos", 8000, 35, success_bonus=0.04),
+)
+
+PVP_PROTECTION_REDUCTIONS = {
+    "gilet_leger": 0.10,
+    "gilet_lourd": 0.20,
+    "shield_tactique": 0.35,
+}
+LEGACY_PROTECTION_ITEM_MIGRATIONS = {
+    "fast_ballistic_helmet": "gilet_leger",
+    "tactical_vest_level_3": "gilet_lourd",
+}
+
+ITEMS += (
+    ShopItem(
+        "gilet_leger",
+        "Gilet pare-balles léger classe IIIA",
+        "protection",
+        900,
+        1,
+        description="Protection discrète sous le hoodie; réduit de 10 points le taux de réussite d'un braquage contre toi.",
+    ),
+    ShopItem(
+        "gilet_lourd",
+        "Gilet pare-balles lourd tactique classe IV",
+        "protection",
+        2600,
+        10,
+        description="Plaques céramiques de protection; réduit de 20 points le taux de réussite d'un braquage contre toi.",
+    ),
+    ShopItem(
+        "shield_tactique",
+        "Shield anti-émeute / bouclier balistique",
+        "protection",
+        6500,
+        20,
+        description="Bouclier lourd de protection rapprochée; réduit de 35 points le taux de réussite d'un braquage et augmente le risque d'intervention du SPVM.",
+    ),
 )
 
 ITEMS += (
@@ -1331,7 +1378,7 @@ SHOP_CATEGORIES = {
     "armes_poing": "Armes — Poing (jeu)",
     "armes_lourdes": "Armes — Collection lourde (jeu)",
     "armes_longues": "Armes — Collection longue (jeu)",
-    "protection": "Protection & Défense (jeu)",
+    "protection": "Protections balistiques",
     "matos": "Matos",
 }
 
@@ -1348,7 +1395,7 @@ ACTION_SPECS = {
         "Le défi BIXI échoue: 45 secondes à Bordeaux/RDP.", PRISON_DURATION_SECONDS,
     ),
     "dep": ActionSpec(
-        "Défi dép de quartier", 10, BASE_SUCCESS_RATE, 220, 45, 12,
+        "Défi dép de quartier", 5, BASE_SUCCESS_RATE, 220, 45, 12,
         "Défi du dép réussi dans le jeu: +{reward}$ et +{xp} XP.",
         "Le défi dérape: 45 secondes à Bordeaux/RDP.", PRISON_DURATION_SECONDS,
     ),
@@ -1358,24 +1405,24 @@ ACTION_SPECS = {
         "Le deal échoue: 45 secondes à Bordeaux/RDP.", PRISON_DURATION_SECONDS,
     ),
     "steal_rav4": ActionSpec(
-        "Défi gamos RAV4", 20, BASE_SUCCESS_RATE, 350, 75, 12,
+        "Convoi blindé — défi RAV4", 10, BASE_SUCCESS_RATE, 350, 75, 12,
         "Défi RAV4 réussi dans le jeu: +{reward}$ et +{xp} XP.",
         "Le défi échoue: 45 secondes à Bordeaux/RDP.", PRISON_DURATION_SECONDS,
         gamos="RAV4", requires_obd=True,
     ),
     "steal_lexus": ActionSpec(
-        "Défi gamos Lexus", 20, BASE_SUCCESS_RATE, 500, 85, 15,
+        "Défi gamos Lexus", 15, BASE_SUCCESS_RATE, 500, 85, 15,
         "Défi Lexus réussi dans le jeu: +{reward}$ et +{xp} XP.",
         "Le défi échoue: 45 secondes à Bordeaux/RDP.", PRISON_DURATION_SECONDS,
         gamos="Lexus", requires_obd=True,
     ),
     "jewelry": ActionSpec(
-        "Défi Plaza St-Hubert", 35, BASE_SUCCESS_RATE, 1200, 120, 25,
+        "Casse de bijouterie — Plaza St-Hubert", 15, BASE_SUCCESS_RATE, 1200, 120, 25,
         "Défi d'arcade Plaza réussi: +{reward}$ et +{xp} XP.",
         "Défi raté: 45 secondes à Bordeaux/RDP.", PRISON_DURATION_SECONDS,
     ),
     "port": ActionSpec(
-        "Défi conteneur du Port", 50, BASE_SUCCESS_RATE, 2500, 160, 35,
+        "Contrebande portuaire — défi conteneur", 7, BASE_SUCCESS_RATE, 2500, 160, 35,
         "Défi d'arcade du Port réussi: +{reward}$ et +{xp} XP.",
         "Défi raté: 45 secondes à Bordeaux/RDP.", PRISON_DURATION_SECONDS,
     ),
@@ -1466,11 +1513,22 @@ def resolve_pvp(
     victim_has_armor: bool = False,
     attacker_weapon_power: int | None = None,
     victim_weapon_power: int | None = None,
+    victim_protection: float = 0.0,
+    victim_protection_item_id: str | None = None,
+    victim_protection_name: str | None = None,
 ) -> PvpResult:
     """Resolve a fictional, non-violent player-versus-player contest."""
-    attack = random.random() if attack_roll is None else attack_roll
-    counter = random.random() if counter_roll is None else counter_roll
-    transfer = random.random() if transfer_roll is None else transfer_roll
+    if not math.isfinite(victim_protection) or not 0 <= victim_protection <= 1:
+        raise ValueError("victim_protection doit être compris entre 0 et 1")
+    attack = (
+        random.randint(0, 9_999) / 10_000 if attack_roll is None else attack_roll
+    )
+    counter = (
+        random.randint(0, 9_999) / 10_000 if counter_roll is None else counter_roll
+    )
+    transfer = (
+        random.randint(0, 9_999) / 10_000 if transfer_roll is None else transfer_roll
+    )
     if not all(0 <= roll < 1 for roll in (attack, counter, transfer)):
         raise ValueError("Les tirages doivent être compris entre 0 inclus et 1 exclu")
 
@@ -1487,7 +1545,7 @@ def resolve_pvp(
     counter_chance = (
         min(0.82, 0.60 + 0.08 * (victim_power - 1))
         if victim_power
-        else 0.35 if victim_has_armor else 0.0
+        else 0.35 if victim_has_armor and victim_protection == 0 else 0.0
     )
     if counter < counter_chance:
         return PvpResult(
@@ -1510,7 +1568,8 @@ def resolve_pvp(
                 + (0.05 if attacker_power else 0.0),
             ),
         )
-    if attack < success_chance:
+    final_success_chance = max(0.10, success_chance - victim_protection)
+    if attack < final_success_chance:
         if attacker_weapon_power is None:
             transfer_rate = 0.15 + 0.20 * transfer
         else:
@@ -1528,6 +1587,12 @@ def resolve_pvp(
         "Le braquage fictif échoue; les condés interviennent. "
         "Aucun cash n'est transféré.",
         prison_seconds=PRISON_DURATION_SECONDS,
+        protection_blocked=(
+            victim_protection > 0
+            and final_success_chance <= attack < success_chance
+        ),
+        protection_item_id=victim_protection_item_id,
+        protection_name=victim_protection_name,
     )
 
 
@@ -1606,9 +1671,7 @@ def resolve_jugg(
 
 
 def prison_deadline(seconds: int = PRISON_DURATION_SECONDS) -> float:
-    """Return the Unix timestamp at which the 45-second jail period expires."""
-    if seconds != PRISON_DURATION_SECONDS:
-        raise ValueError(
-            f"La durée de prison est fixée à {PRISON_DURATION_SECONDS} secondes"
-        )
-    return time.time() + jail_duration
+    """Return the Unix timestamp at which a positive jail period expires."""
+    if seconds <= 0:
+        raise ValueError("La durée de prison doit être strictement positive.")
+    return time.time() + seconds

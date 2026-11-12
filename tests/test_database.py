@@ -5,6 +5,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import aiosqlite
 
@@ -73,6 +74,115 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [item["item_id"] for item in inventory], ["montreal_toque"]
         )
+
+    async def test_database_uses_wal_and_market_state_survives_restart(self) -> None:
+        user_id, chat_id = 103, -1003
+        await self.database.ensure_player(user_id, "market_player", chat_id)
+        purchase = await self.database.trade_investment(
+            user_id, chat_id, "SOL", "buy", 2
+        )
+        self.assertEqual((purchase["status"], purchase["total"]), ("ok", 290))
+
+        async with aiosqlite.connect(self.database.path) as connection:
+            cursor = await connection.execute("PRAGMA journal_mode")
+            self.assertEqual((await cursor.fetchone())[0].casefold(), "wal")
+
+        restarted = Database(self.database.path)
+        await restarted.initialize()
+        snapshot = await restarted.get_market_snapshot(user_id, chat_id)
+        sol = next(asset for asset in snapshot["assets"] if asset["symbol"] == "SOL")
+        self.assertEqual(sol["quantity"], 2.0)
+        self.assertEqual(sol["average_cost"], 145.0)
+        player = await restarted.get_player(user_id, chat_id)
+        self.assertEqual(player["cash"], 210)
+
+    async def test_market_updates_at_intervals_and_trades_are_chat_scoped(self) -> None:
+        user_id, chat_id = 104, -1004
+        await self.database.ensure_player(user_id, "investor", chat_id)
+        await self.database.ensure_player(user_id, "investor", chat_id - 1)
+        initial = await self.database.get_market_snapshot(user_id, chat_id)
+        initial_sol = next(asset for asset in initial["assets"] if asset["symbol"] == "SOL")
+        self.assertEqual(initial_sol["market_change_percent"], 0)
+
+        bought = await self.database.trade_investment(
+            user_id, chat_id, "SOL", "buy", 2
+        )
+        self.assertEqual((bought["status"], bought["cash"]), ("ok", 210))
+        insufficient = await self.database.trade_investment(
+            user_id, chat_id, "BTC", "buy", 0.01
+        )
+        self.assertEqual(insufficient["status"], "funds")
+
+        async with self.database.transaction() as connection:
+            await connection.execute(
+                "UPDATE market_assets SET last_updated = ?",
+                (time.time() - 181,),
+            )
+        with (
+            patch("database.random.uniform", return_value=0.1),
+            patch("database.random.random", return_value=0.99),
+        ):
+            updated_count = await self.database.update_market_prices()
+        self.assertEqual(updated_count, 7)
+        snapshot = await self.database.get_market_snapshot(user_id, chat_id)
+        updated_sol = next(asset for asset in snapshot["assets"] if asset["symbol"] == "SOL")
+        self.assertAlmostEqual(updated_sol["market_change_percent"], 10)
+        self.assertAlmostEqual(updated_sol["profit_percent"], 10)
+        self.assertAlmostEqual(snapshot["portfolio"]["profit"], 29)
+
+        sale = await self.database.trade_investment(
+            user_id, chat_id, "SOL", "sell", 1
+        )
+        self.assertEqual((sale["status"], sale["remaining"]), ("ok", 1.0))
+        self.assertEqual(sale["profit_percent"], 10)
+        other_chat = await self.database.get_market_snapshot(user_id, chat_id - 1)
+        self.assertEqual(other_chat["portfolio"]["value"], 0)
+        liquidated = await self.database.sell_all_investments(user_id, chat_id)
+        self.assertEqual((liquidated["status"], liquidated["total"]), ("ok", 160))
+        self.assertEqual(
+            (await self.database.get_player(user_id, chat_id))["cash"], 530
+        )
+        self.assertEqual(
+            (await self.database.get_player(user_id, chat_id - 1))["cash"], 500
+        )
+
+    async def test_market_rejects_non_finite_inputs_and_stored_prices(self) -> None:
+        with self.assertRaisesRegex(ValueError, "doit être finie"):
+            await self.database.update_market_prices(float("nan"))
+
+        async with self.database.transaction() as connection:
+            await connection.execute(
+                "UPDATE market_assets SET current_price = ? WHERE symbol = 'SOL'",
+                (float("inf"),),
+            )
+        with self.assertRaisesRegex(RuntimeError, "Données de marché invalides"):
+            await self.database.update_market_prices(time.time() + 181)
+
+    async def test_market_events_are_recorded_and_full_admin_reset_clears_positions(self) -> None:
+        user_id, chat_id = 105, -1005
+        await self.database.ensure_player(user_id, "market_reset", chat_id)
+        purchase = await self.database.trade_investment(
+            user_id, chat_id, "SOL", "buy", 1
+        )
+        self.assertEqual(purchase["status"], "ok")
+        async with self.database.transaction() as connection:
+            await connection.execute(
+                "UPDATE market_assets SET last_updated = ?",
+                (time.time() - 181,),
+            )
+        with (
+            patch("database.random.uniform", return_value=0),
+            patch("database.random.random", return_value=0.01),
+            patch("database.random.choice", return_value=-0.12),
+        ):
+            await self.database.update_market_prices()
+        snapshot = await self.database.get_market_snapshot(user_id, chat_id)
+        sol = next(asset for asset in snapshot["assets"] if asset["symbol"] == "SOL")
+        self.assertEqual(sol["last_event"], "Correction de marché")
+
+        self.assertEqual(await self.database.admin_reset_player(user_id, chat_id), "ok")
+        reset_snapshot = await self.database.get_market_snapshot(user_id, chat_id)
+        self.assertEqual(reset_snapshot["portfolio"]["value"], 0)
 
     async def test_hustle_cooldown_is_atomic_and_global_to_the_player(self) -> None:
         await self.database.ensure_player(-100123, "admin anonyme", -100123)
@@ -212,6 +322,77 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(all_items["count"], len(ITEMS))
         self.assertEqual(repeated_all["count"], len(ITEMS))
         self.assertEqual(len(inventory), len(ITEMS))
+
+    async def test_admin_revocations_are_clamped_and_group_scoped(self) -> None:
+        user_id, chat_id = 228, -100228
+        await self.database.ensure_player(user_id, "revoke_target", chat_id)
+        await self.database.ensure_player(user_id, "revoke_target", chat_id - 1)
+        async with self.database.transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE players SET cash = 1200, bank = 800, xp = 20000, level = 20
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (user_id, chat_id),
+            )
+        await self.database.admin_give_item(user_id, chat_id, "montreal_toque")
+        await self.database.admin_give_item(user_id, chat_id, "montreal_toque")
+
+        cash = await self.database.admin_revoke_cash(user_id, chat_id, 300)
+        bank = await self.database.admin_revoke_cash(
+            user_id, chat_id, None, "bank"
+        )
+        xp = await self.database.admin_revoke_xp(user_id, chat_id, 5000)
+        level = await self.database.admin_revoke_level(user_id, chat_id, 3)
+        item = await self.database.admin_revoke_item(
+            user_id, chat_id, "montreal_toque"
+        )
+
+        self.assertEqual((cash["balance"], cash["removed"]), (900, 300))
+        self.assertEqual((bank["balance"], bank["removed"]), (0, 800))
+        self.assertEqual((xp["xp"], xp["level"], xp["xp_removed"]), (15000, 17, 5000))
+        self.assertEqual((level["level"], level["xp"]), (14, 9100))
+        self.assertEqual(item["status"], "ok")
+        inventory = await self.database.get_inventory(user_id, chat_id)
+        self.assertEqual(inventory[0]["quantity"], 1)
+
+        clear_cash = await self.database.admin_revoke_cash(
+            user_id, chat_id, None
+        )
+        clear_xp = await self.database.admin_revoke_xp(user_id, chat_id, None)
+        clear_level = await self.database.admin_revoke_level(
+            user_id, chat_id, None
+        )
+        clear_inventory = await self.database.admin_revoke_item(
+            user_id, chat_id, None
+        )
+        player = await self.database.get_player(user_id, chat_id)
+        other_group_player = await self.database.get_player(user_id, chat_id - 1)
+        self.assertEqual((clear_cash["balance"], player["cash"]), (0, 0))
+        self.assertEqual((clear_xp["xp"], clear_level["level"]), (0, 1))
+        self.assertEqual((player["xp"], player["level"]), (0, 1))
+        self.assertEqual(clear_inventory["count"], 1)
+        self.assertEqual(await self.database.get_inventory(user_id, chat_id), [])
+        self.assertEqual(
+            (other_group_player["cash"], other_group_player["bank"],
+             other_group_player["xp"], other_group_player["level"]),
+            (500, 0, 0, 1),
+        )
+
+    async def test_developer_mode_bypasses_the_pvp_level_requirement(self) -> None:
+        await self.database.ensure_player(229, "dev_attacker", -100229)
+        await self.database.ensure_player(230, "dev_victim", -100229)
+        result = await self.database.apply_pvp_result(
+            229,
+            230,
+            "success",
+            0,
+            None,
+            70,
+            chat_id=-100229,
+            god_mode=True,
+        )
+        self.assertEqual(result["status"], "success")
 
     async def test_dev_mode_ignores_prison_and_waives_rental_repairs(self) -> None:
         user_id, chat_id = 225, -100225
@@ -754,8 +935,9 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             "ak_47": ("armes_longues", 8500),
             "ar15_custom": ("armes_longues", 11000),
             "remington_870": ("armes_longues", 2200),
-            "tactical_vest_level_3": ("protection", 1800),
-            "fast_ballistic_helmet": ("protection", 1200),
+            "gilet_leger": ("protection", 900),
+            "gilet_lourd": ("protection", 2600),
+            "shield_tactique": ("protection", 6500),
         }
         catalog = {item.item_id: item for item in ITEMS}
         self.assertTrue(set(expected) <= catalog.keys())
@@ -772,7 +954,13 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await self.database.purchase_item(409, "beretta_m9"), "ok")
         self.assertEqual(
-            await self.database.purchase_item(409, "tactical_vest_level_3"), "ok"
+            await self.database.purchase_item(409, "gilet_lourd"), "ok"
+        )
+        self.assertEqual(
+            await self.database.purchase_item(409, "gilet_leger"), "ok"
+        )
+        self.assertEqual(
+            await self.database.purchase_item(409, "shield_tactique"), "ok"
         )
         effects = await self.database.get_item_effects(409)
         inventory = await self.database.get_inventory(409)
@@ -780,12 +968,85 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(effects["weapon_name"], "Beretta M9 9 mm — édition arcade")
         self.assertTrue(effects["has_armor"])
         self.assertEqual(
-            effects["armor_name"], "Gilet de protection renforcé — niveau III+ (jeu)"
+            effects["protection_item_id"], "shield_tactique"
+        )
+        self.assertEqual(effects["protection_reduction"], 0.35)
+        self.assertEqual(
+            effects["protection_name"], "Shield anti-émeute / bouclier balistique"
         )
         self.assertEqual(
             {item["item_id"] for item in inventory},
-            {"beretta_m9", "tactical_vest_level_3"},
+            {"beretta_m9", "gilet_lourd", "gilet_leger", "shield_tactique"},
         )
+
+    async def test_protection_strength_is_highest_owned_and_group_scoped(self) -> None:
+        user_id, protected_chat, other_chat = 410, -100410, -100411
+        await self.database.ensure_player(user_id, "shielded", protected_chat)
+        await self.database.ensure_player(user_id, "shielded", other_chat)
+        async with self.database.transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE players SET cash = 20000, level = 20, xp = 19000
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (user_id, protected_chat),
+            )
+        for item_id in ("gilet_leger", "gilet_lourd", "shield_tactique"):
+            self.assertEqual(
+                await self.database.purchase_item(user_id, item_id, protected_chat),
+                "ok",
+            )
+
+        protected = await self.database.get_item_effects(user_id, protected_chat)
+        unprotected = await self.database.get_item_effects(user_id, other_chat)
+        self.assertEqual(protected["protection_reduction"], 0.35)
+        self.assertEqual(protected["protection_item_id"], "shield_tactique")
+        self.assertEqual(unprotected["protection_reduction"], 0.0)
+        self.assertIsNone(unprotected["protection_item_id"])
+
+    async def test_legacy_protection_inventory_migrates_without_losing_quantities(self) -> None:
+        user_id, chat_id = 411, -100411
+        await self.database.ensure_player(user_id, "legacy_protected", chat_id)
+        async with self.database.transaction() as connection:
+            await connection.executemany(
+                """
+                INSERT INTO items
+                    (item_id, name, category, price, min_level, description)
+                VALUES (?, ?, 'protection', 1000, 1, 'Ancienne protection')
+                """,
+                [
+                    ("fast_ballistic_helmet", "Ancien casque balistique"),
+                    ("tactical_vest_level_3", "Ancien gilet tactique"),
+                ],
+            )
+            await connection.execute(
+                """
+                INSERT INTO inventory (chat_id, user_id, item_id, quantity)
+                VALUES (?, ?, 'gilet_leger', 3)
+                """,
+                (chat_id, user_id),
+            )
+            await connection.executemany(
+                """
+                INSERT INTO inventory (chat_id, user_id, item_id, quantity)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (chat_id, user_id, "fast_ballistic_helmet", 1),
+                    (chat_id, user_id, "tactical_vest_level_3", 2),
+                ],
+            )
+
+        await self.database.initialize()
+
+        inventory = await self.database.get_inventory(user_id, chat_id)
+        quantities = {item["item_id"]: item["quantity"] for item in inventory}
+        self.assertEqual(quantities["gilet_leger"], 4)
+        self.assertEqual(quantities["gilet_lourd"], 2)
+        self.assertNotIn("fast_ballistic_helmet", quantities)
+        self.assertNotIn("tactical_vest_level_3", quantities)
+        effects = await self.database.get_item_effects(user_id, chat_id)
+        self.assertEqual(effects["protection_reduction"], 0.20)
 
     async def test_new_clothing_catalog_is_seeded_and_purchases_persist_descriptions(self) -> None:
         clothing_category = "vetements_accessoires"
@@ -1182,6 +1443,26 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(counter["fine"], 100)
         self.assertEqual((await self.database.get_player(505))["cash"], 1612)
         self.assertEqual((await self.database.get_player(606))["cash"], 388)
+
+        async with self.database.transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE players SET in_prison_until = 0
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (505, 0),
+            )
+        failed = await self.database.apply_pvp_result(
+            505,
+            606,
+            "failed",
+            75,
+            time.time() + 60,
+            0,
+            chat_id=0,
+        )
+        self.assertEqual((failed["status"], failed["fine"]), ("failed", 75))
+        self.assertEqual((await self.database.get_player(505))["cash"], 1537)
 
     async def test_weapon_profile_uses_strongest_weapon_in_the_current_group(self) -> None:
         await self.database.ensure_player(506, "weapon_profile", -100506)
@@ -1690,6 +1971,87 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(primary_key, ["chat_id", "user_id"])
         self.assertEqual(retained_cash, 1200)
 
+    async def test_legacy_inventory_without_chat_id_is_not_copied_between_groups(
+        self,
+    ) -> None:
+        legacy_path = Path(self.temp_dir.name) / "ambiguous_inventory.sqlite3"
+        connection = sqlite3.connect(legacy_path)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE players (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    cash INTEGER NOT NULL DEFAULT 500,
+                    heat INTEGER NOT NULL DEFAULT 0,
+                    in_prison_until REAL NOT NULL DEFAULT 0,
+                    gamos TEXT NOT NULL DEFAULT 'Aucun',
+                    level INTEGER NOT NULL DEFAULT 1,
+                    xp INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (chat_id, user_id)
+                )
+                """
+            )
+            connection.executemany(
+                """
+                INSERT INTO players (chat_id, user_id, username)
+                VALUES (?, ?, ?)
+                """,
+                [
+                    (-100901, 901, "group_only"),
+                    (-100902, 901, "group_only"),
+                    (902, 902, "private"),
+                    (-100903, 902, "private"),
+                    (-100904, 902, "private"),
+                ],
+            )
+            connection.execute(
+                """
+                CREATE TABLE inventory (
+                    user_id INTEGER NOT NULL,
+                    item_id TEXT NOT NULL,
+                    quantity INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY (user_id, item_id)
+                )
+                """
+            )
+            connection.executemany(
+                "INSERT INTO inventory (user_id, item_id) VALUES (?, ?)",
+                [(901, "tech_fleece"), (902, "montreal_toque")],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = Database(str(legacy_path))
+        with self.assertLogs("database", level="WARNING") as captured:
+            await migrated.initialize()
+
+        self.assertIn("901", captured.output[0])
+        self.assertEqual(await migrated.get_inventory(901, -100901), [])
+        self.assertEqual(await migrated.get_inventory(901, -100902), [])
+        self.assertEqual(
+            [item["item_id"] for item in await migrated.get_inventory(902, 902)],
+            ["montreal_toque"],
+        )
+        self.assertEqual(await migrated.get_inventory(902, -100903), [])
+        self.assertEqual(await migrated.get_inventory(902, -100904), [])
+        self.assertEqual(
+            [item["item_id"] for item in await migrated.get_inventory(901, 901)],
+            [],
+        )
+        connection = sqlite3.connect(legacy_path)
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM inventory_legacy"
+                ).fetchone()[0],
+                2,
+            )
+        finally:
+            connection.close()
+
     async def test_initialize_creates_missing_database_parent_directory(self) -> None:
         database_path = Path(self.temp_dir.name) / "nested" / "state.sqlite3"
         database = Database(str(database_path))
@@ -1702,6 +2064,10 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             Path(database.path),
             Path(__file__).resolve().parents[1] / "relative-state.sqlite3",
         )
+
+    async def test_database_rejects_non_persistent_in_memory_path(self) -> None:
+        with self.assertRaisesRegex(ValueError, "fichier persistant"):
+            Database(":memory:")
 
     async def test_initialize_alters_existing_context_players_to_add_bank(self) -> None:
         existing_path = Path(self.temp_dir.name) / "existing.sqlite3"

@@ -27,14 +27,15 @@ numériques séparés par des virgules; `ADMIN_USER_ID` est aussi accepté pour 
 seul administrateur. Les ID ne doivent pas être des usernames.
 
 Le fichier SQLite `rabza_jugg_bot.sqlite3` est créé automatiquement au premier
-lancement, dans le dossier du projet. Un chemin relatif donné par
-`DATABASE_PATH` est également résolu depuis ce dossier, indépendamment du
-dossier courant du processus. Les dossiers parents manquants sont créés au
-démarrage.
+lancement, dans le dossier du projet. `DB_PATH` accepte un chemin absolu; un
+chemin relatif est résolu depuis le dossier du projet, indépendamment du
+dossier courant du processus. `DATABASE_PATH` reste accepté comme ancien alias.
+Les dossiers parents manquants sont créés au démarrage et le journal SQLite
+fonctionne en mode WAL avec des commits synchrones.
 
 Sur Railway (ou tout hébergeur à système de fichiers éphémère), ces réglages
 ne remplacent pas un volume persistant : attache un volume au service, monte-le
-par exemple sur `/data`, puis définis `DATABASE_PATH` à
+par exemple sur `/data`, puis définis `DB_PATH` à
 `/data/rabza_jugg_bot.sqlite3`. Garde le même chemin de montage lors des
 redéploiements. Sans volume persistant, les données locales au conteneur ne
 peuvent pas être garanties après un redéploiement.
@@ -44,8 +45,10 @@ Les migrations gardent les anciennes tables `players_legacy` et
 avoir vérifié une sauvegarde externe et les données migrées.
 Les comptes, inventaires et peines sont isolés par conversation Telegram:
 un même utilisateur a donc un état distinct en privé et dans chaque groupe.
-`/braquer @username` est disponible uniquement dans un groupe ou supergroupe.
-Une peine dure exactement 45 secondes et son échéance est stockée en timestamp
+`/braquer @username` est disponible uniquement dans un groupe ou supergroupe
+et demande le niveau 20, sauf en Mode Développeur. Un échec entraîne une amende
+et une peine aléatoires (30 à 120 secondes); les autres activités conservent
+leur peine standard de 45 secondes. Les échéances sont stockées en timestamp
 Unix; les anciennes bases sont migrées au démarrage. Les comptes historiques
 sans `chat_id` sont conservés dans le contexte privé correspondant à leur
 `user_id`.
@@ -76,24 +79,18 @@ Ne publie jamais le token dans le code ou dans un dépôt.
 - `/withdraw <montant/all>` — retirer du cash de la banque
 - `/give <montant>` — transférer du cash en répondant à un joueur
 - `/give @username <montant>` — transférer du cash à un joueur du groupe
+- `/invest` — consulter le marché, ses actifs et son portefeuille
+- `/invest buy <actif> <parts>` — acheter des parts au cours actuel
+- `/invest sell <actif> <parts/all>` — vendre des parts d'un actif
 - `/drive` — faire un trajet rémunéré; véhicule requis, cooldown 60s
-- `/ride` — alias de `/drive`
 - `/repair` — payer les réparations avant de reprendre une location endommagée
 - `/return` — restituer une location et récupérer la caution restante
-- `/braquer @username` — tenter un braquage PvP; niveau 20+, groupe seulement
+- `/braquer @username` — braquage PvP niveau 20+; risque d'amende et de peine aléatoires
 - `/shoot @username` — duel armé; cible en riposte, butin et cooldown par cible
 - `/shop` — parcourir les sapes, l’équipement, les véhicules et locations
 - `/missions` — consulter les missions, leurs niveaux, gains et prérequis
-- `/mission <id>` — lancer une mission (civic, audi, entrepot, blindee, helico)
-- `/hustle <id>` — lancer un défi (colis, phishing, catalyseur, vapote, etc.)
-- `/mission_colis` — défi logistique; véhicule requis, cooldown 20s
-- `/mission_phishing` — défi d’audit numérique; cooldown 25s
-- `/mission_catalyseur` — défi de contrôle automobile; cooldown 30s
-- `/mission_vapote` — défi de service au kiosque; cooldown 15s
-- `/mission_depanneur` — défi de gestion des stocks; cooldown 30s
-- `/mission_sneakers` — défi de collection; cooldown 25s
+- `/mission <id>` — lancer une mission ou un défi par identifiant
 - `/jugg` — ouvrir les activités d’arcade et leurs paliers
-- `/juggling` — alias de `/jugg`
 - `/casino` — ouvrir les jeux et consulter leur syntaxe
 - `/admin` — ouvrir le panneau de contrôle réservé aux administrateurs
 - `/devmode` — basculer entre Mode Joueur et Mode Développeur
@@ -101,7 +98,10 @@ Ne publie jamais le token dans le code ou dans un dépôt.
 - `/give_xp [@username] [montant|max]` — ajouter l'XP exacte ou, sans montant, la porter au plafond
 - `/set_level [@username] [niveau]` — fixer le niveau exact ou, sans niveau, atteindre le maximum
 - `/give_item [@username] [id_item|nom|all]` — donner un article ou, sans item/avec `all`, tout le catalogue
-- `/give_infinite [@username] [montant] [cash|bank]` — créditer un joueur du groupe; 1 milliard par défaut
+- `/revoke_cash [@username] [montant] [cash|bank]` — retirer un montant ou vider le compte choisi sans montant
+- `/revoke_xp [@username] [montant]` — retirer de l'XP ou remettre l'XP à zéro sans montant
+- `/revoke_level [@username] [niveaux]` — retirer des niveaux ou repasser au niveau 1 sans nombre
+- `/revoke_item [@username] [id_item|nom|all]` — retirer un exemplaire ou vider l'inventaire sans item/avec `all`
 - `/admin_reset [@username] [repair|full CONFIRMER]` — réparer ou réinitialiser un profil du groupe
 
 `/devmode` et les boutons de `/admin` basculent un état persistant par ID admin.
@@ -112,6 +112,11 @@ Sans montant, `/give_cash` porte également le compte sélectionné à ce plafon
 L'XP sans montant est portée à 999 999 999 999 XP; un niveau fixé sans argument
 est réglé au niveau maximum. `/give_item` sans argument ou avec `all` ajoute une
 référence du catalogue à l'inventaire sans dupliquer les entrées déjà possédées.
+Les commandes `/revoke_*` sont réservées au Mode Développeur: un montant précis
+retire jusqu'à cette quantité sans passer sous zéro; l'absence de valeur remet
+le cash/banque ou l'XP à zéro, le niveau à 1 ou vide l'inventaire. La révocation
+d'un article retire un exemplaire et les changements restent limités au groupe
+courant.
 L'admin ignore les cooldowns de hustle, jugg, conduite et duel, peut agir malgré
 une peine, ne peut pas être envoyé en prison par les missions/PVP et bénéficie
 de réparations gratuites (les réparations de location déjà dues sont faites
@@ -125,11 +130,19 @@ préserve l'économie, le niveau, l'XP et l'inventaire; le mode `full` exige
 conversation visée. Un crédit ou une réinitialisation ne touche jamais le même
 joueur dans les autres groupes.
 
-Le menu `/jugg` inclut les paliers fictifs Petit Hustle de Bloc (jusqu'à
-1 200$), Gros Business Centre-Ville (4 500$) et Opération Internationale /
-Masterclass (15 000$). Chaque palier a une chance de réussite, une amende ou
-une courte peine simulée en cas d'échec, et son propre cooldown de 15, 25 ou
-30 secondes, persisté par joueur et conversation.
+Le menu `/jugg` débloque ses paliers aux niveaux 1, 3, 7 et 15. Chaque palier
+a une chance de réussite, une amende ou une courte peine simulée en cas
+d'échec, et son propre cooldown de 15, 25, 30 ou 35 secondes, persisté par
+joueur et conversation. Les missions suivent
+également leurs prérequis jusqu'au niveau 20+; au niveau maximal, aucun palier
+inférieur ne reste indiqué comme verrouillé.
+
+Le marché BTC/ETH/SOL et les actions 514-TEL, ANJOU-MOTORS, HYDRO-MTL et
+RUE-STE-CATH évolue à intervalles de trois minutes. Les cours et positions sont
+persistés; les achats utilisent le cash liquide, et l'affichage donne les
+variations en pourcentage, le coût moyen, la valeur et le gain/perte net du
+portefeuille. Les parts peuvent être vendues individuellement ou avec
+`/invest sell all`.
 
 Dans les groupes, les commandes acceptent aussi la mention du bot, par exemple
 `/help@Rabza_Jugg_V2_bot` et `/casino@Rabza_Jugg_V2_bot`.
@@ -180,18 +193,24 @@ moins les réparations issues d'incidents aléatoires (25% de risque par trajet)
 Un incident mineur ou modéré immobilise la location jusqu'au paiement des frais
 de remise en état avec `/repair`; un incident majeur termine la location. Une
 caution épuisée entraîne la confiscation. Les locations sont isolées par joueur
-et groupe et apparaissent dans /inventory. `/drive` (alias `/ride`) rapporte
+et groupe et apparaissent dans /inventory. `/drive` rapporte
 75$ et 20 XP quand le trajet est clean; l'entretien d'un véhicule possédé est
-rare. Le défi `/mission_colis` et les missions longues exigent un véhicule et
+rare. Le défi `/mission colis` et les missions longues exigent un véhicule et
 vérifient le risque de trajet; aucune vérification passive n'est faite.
-Les catégories Armes — Poing, Collection lourde, Collection longue et Protection
-proposent des objets d'arcade fictifs. L'équipement est acheté avec le solde et
-conservé dans l'inventaire; les objets d'arme comptent comme équipement pour les
-défis PVP simulés, et l'équipement de protection ajoute une chance de riposte
-virtuelle. Ces effets sont exclusivement des règles de jeu.
+Les catégories Armes — Poing, Collection lourde, Collection longue et Protections
+balistiques proposent des objets d'arcade fictifs. Les gilets léger IIIA, lourd
+IV et le shield tactique réduisent respectivement de 10, 20 et 35 points le
+taux de réussite d'un braquage contre leur propriétaire; seul l'équipement le
+plus puissant compte, avec un plancher de réussite de 10%. Les anciennes
+protections possédées sont converties au démarrage sans perdre les quantités.
+Les gadgets de mission (dont le boîtier OBD) restent disponibles pour préserver
+les prérequis existants. Ces effets sont exclusivement des règles de jeu.
 Les braquages utilisent la meilleure arme de l'inventaire dans le groupe:
 équipement de poing (puissance 1), équipement lourd (2) et équipement long (3).
-Une cible mieux équipée améliore sa défense et peut déclencher une riposte.
+Une cible mieux armée peut déclencher une riposte; ses protections balistiques
+réduisent aussi directement le taux de réussite adverse sans se cumuler. Une
+protection qui fait échouer le tirage augmente la probabilité d'une arrestation
+dans les règles fictives du jeu.
 `/shoot` applique les mêmes puissances à un duel aléatoire; son cooldown est de
 60 secondes par attaquant, cible et groupe. Le perdant peut perdre une part de
 son cash liquide, payer des frais de soins et être envoyé en taule; la banque

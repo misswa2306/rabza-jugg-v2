@@ -25,14 +25,18 @@ if any(admin_id <= 0 for admin_id in ADMIN_USER_IDS):
     raise ValueError("Les identifiants configurés dans ADMIN_USER_IDS doivent être positifs.")
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-configured_database_path = os.getenv("DATABASE_PATH", "").strip()
+configured_database_path = (
+    os.getenv("DB_PATH", "").strip()
+    or os.getenv("DATABASE_PATH", "").strip()
+)
 if configured_database_path:
     database_path = Path(configured_database_path).expanduser()
     if not database_path.is_absolute():
         database_path = (PROJECT_ROOT / database_path).resolve()
 else:
     database_path = PROJECT_ROOT / "rabza_jugg_bot.sqlite3"
-DATABASE_PATH = str(database_path)
+DB_PATH = str(database_path)
+DATABASE_PATH = DB_PATH
 
 
 def validate_config() -> None:
